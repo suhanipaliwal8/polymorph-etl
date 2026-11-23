@@ -112,3 +112,25 @@ def test_example_pipelines_are_valid(filename, target_url):
     env = {"SOURCE_URL": POSTGRES, "TARGET_URL": target_url}
     manifest = load_manifest(EXAMPLES / filename, env=env)
     assert manifest.version == 1
+
+def test_tables_list_is_optional(tmp_path):
+    manifest = load_manifest(write_manifest(tmp_path), env=ENV)
+    assert manifest.tables is None
+
+
+def test_tables_list_is_loaded(tmp_path):
+    content = VALID + "tables:\n  - customers\n  - orders\n"
+    manifest = load_manifest(write_manifest(tmp_path, content), env=ENV)
+    assert manifest.tables == ["customers", "orders"]
+
+
+def test_empty_tables_list_is_rejected(tmp_path):
+    content = VALID + "tables: []\n"
+    with pytest.raises(ManifestError, match="at least one table"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_duplicate_tables_are_rejected(tmp_path):
+    content = VALID + "tables:\n  - orders\n  - orders\n"
+    with pytest.raises(ManifestError, match="duplicate"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
