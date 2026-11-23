@@ -23,7 +23,7 @@ crash-safe precision.
 - [x] Phase 0: Project skeleton
 - [x] Phase 1: Demo databases (Docker Compose + seed data)
 - [x] Phase 2: CLI and pipeline manifest
-- [ ] Phase 3: Keyset streaming extractor
+- [x] Phase 3: Schema discovery (`inspect`) and draft manifests
 - [ ] Phase 4: MongoDB bulk loader
 - [ ] Phase 5: Type translator
 - [ ] Phase 6: Transform engine
@@ -72,6 +72,27 @@ export TARGET_URL="mongodb://localhost:27018/shop"
 polymorph --help
 polymorph validate examples/pipelines/postgres-to-mongo.yaml
 ```
+
+### Inspect a source database
+
+```bash
+export SOURCE_URL="postgresql+psycopg://polymorph:polymorph@localhost:5433/shop"
+
+# Engine, tables (in foreign-key order), columns, keys, row counts, warnings
+polymorph inspect
+
+# Generate a draft pipeline manifest to review and edit
+polymorph inspect --generate-manifest pipeline.yaml --mode sql-to-nosql
+polymorph validate pipeline.yaml
+```
+
+`inspect` is read-only. Use `--no-counts` to skip row counts on very large
+tables and `--schema` to inspect a non-default schema.
+
+Database drivers are optional extras: `pip install "polymorph-etl[postgres]"`
+or `"polymorph-etl[mysql]"`. See
+[`docs/manifest-reference.md`](docs/manifest-reference.md) for the manifest
+format and connection URL examples.
 
 Example manifests live in [`examples/pipelines/`](examples/pipelines/).
 See [`docs/workflow-and-outputs.md`](docs/workflow-and-outputs.md) for the
