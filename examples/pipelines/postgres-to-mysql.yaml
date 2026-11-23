@@ -1,0 +1,13 @@
+# SQL-to-SQL pipeline: any supported SQL source to any supported SQL target.
+version: 1
+name: shop-to-mysql
+mode: sql-to-sql
+
+source:
+  url: ${SOURCE_URL}
+
+target:
+  url: ${TARGET_URL}
+
+settings:
+  batch_size: 1000

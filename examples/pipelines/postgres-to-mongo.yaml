@@ -1,0 +1,15 @@
+# Pipeline manifest, format version 1.
+# Connection URLs come from environment variables, so passwords
+# never live in this file (or in git).
+version: 1
+name: shop-to-mongo
+mode: sql-to-nosql
+
+source:
+  url: ${SOURCE_URL}
+
+target:
+  url: ${TARGET_URL}
+
+settings:
+  batch_size: 1000
