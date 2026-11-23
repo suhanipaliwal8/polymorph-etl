@@ -18,7 +18,7 @@ crash-safe precision.
 
 ## Roadmap
 
-- [ ] Phase 0: Project skeleton
+- [x] Phase 0: Project skeleton
 - [ ] Phase 1: Demo databases (Docker Compose + seed data)
 - [ ] Phase 2: CLI and pipeline manifest
 - [ ] Phase 3: Keyset streaming extractor
