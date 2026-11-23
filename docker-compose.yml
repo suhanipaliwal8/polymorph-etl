@@ -1,0 +1,56 @@
+# Demo databases for PolyMorph ETL.
+# NOTE: these credentials are throwaway, for local demo only.
+services:
+  postgres:
+    image: postgres:16
+    container_name: polymorph-postgres
+    environment:
+      POSTGRES_USER: polymorph
+      POSTGRES_PASSWORD: polymorph
+      POSTGRES_DB: shop
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymorph -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mysql:
+    image: mysql:8.4
+    container_name: polymorph-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+      MYSQL_USER: polymorph
+      MYSQL_PASSWORD: polymorph
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  mongo:
+    image: mongo:7
+    container_name: polymorph-mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  mysql_data:
+  mongo_data:

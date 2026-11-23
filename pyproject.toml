@@ -12,6 +12,12 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+demo = [
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "pymysql>=1.1",
+    "cryptography>=42",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
