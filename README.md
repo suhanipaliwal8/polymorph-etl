@@ -22,7 +22,7 @@ crash-safe precision.
 
 - [x] Phase 0: Project skeleton
 - [x] Phase 1: Demo databases (Docker Compose + seed data)
-- [ ] Phase 2: CLI and pipeline manifest
+- [x] Phase 2: CLI and pipeline manifest
 - [ ] Phase 3: Keyset streaming extractor
 - [ ] Phase 4: MongoDB bulk loader
 - [ ] Phase 5: Type translator
@@ -60,6 +60,26 @@ The seed data includes a 1:1 relation (`customers` to `customer_profiles`),
 `DECIMAL(19,4)` value, and deliberate poison records used to exercise the
 dead-letter queue.
 
+## Usage
+
+Pipelines are described in a YAML manifest. Connection URLs are read from
+environment variables so credentials never live in the file.
+
+```bash
+export SOURCE_URL="postgresql+psycopg://polymorph:polymorph@localhost:5433/shop"
+export TARGET_URL="mongodb://localhost:27018/shop"
+
+polymorph --help
+polymorph validate examples/pipelines/postgres-to-mongo.yaml
+```
+
+Example manifests live in [`examples/pipelines/`](examples/pipelines/).
+See [`docs/workflow-and-outputs.md`](docs/workflow-and-outputs.md) for the
+planned end-to-end workflow, run reports and exit codes.
+
+Special characters in passwords must be URL-encoded inside connection URLs
+(for example `@` becomes `%40`).
+
 ## Tech stack
 
-Python 3.12, PostgreSQL, MySQL, MongoDB, SQLite, Docker Compose, pytest.
+Python 3.12, Typer, Pydantic, SQLAlchemy, PostgreSQL, MySQL, MongoDB, SQLite, Docker Compose, pytest.
