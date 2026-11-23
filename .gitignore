@@ -18,3 +18,7 @@ Thumbs.db
 *.db
 dlq_errors.jsonl
 .env
+
+# Local pipeline drafts and run output
+/pipeline.yaml
+/runs/

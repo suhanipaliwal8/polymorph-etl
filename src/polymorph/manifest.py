@@ -150,3 +150,49 @@ def load_manifest(path: Path, env: Mapping[str, str] | None = None) -> Manifest:
         return Manifest.model_validate(resolved)
     except ValidationError as exc:
         raise ManifestError(_format_errors(exc)) from exc
+
+class Manifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    mode: Mode
+    source: Endpoint
+    target: Endpoint
+    settings: Settings = Field(default_factory=Settings)
+    tables: list[str] | None = None
+
+    @field_validator("tables")
+    @classmethod
+    def _tables_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if not value:
+            raise ValueError(
+                "must list at least one table (omit the key to migrate all tables)"
+            )
+        if any(not name.strip() for name in value):
+            raise ValueError("table names must not be empty")
+        duplicates = sorted({name for name in value if value.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate table names: {', '.join(duplicates)}")
+        return value
+
+    @model_validator(mode="after")
+    def _schemes_must_match_mode(self) -> Self:
+        source = url_scheme(self.source.url)
+        target = url_scheme(self.target.url)
+
+        if source not in SQL_SCHEMES:
+            raise ValueError(
+                f"source scheme '{source}' is not a supported SQL database "
+                f"(supported: {', '.join(sorted(SQL_SCHEMES))})"
+            )
+
+        allowed = SQL_SCHEMES if self.mode is Mode.SQL_TO_SQL else NOSQL_SCHEMES
+        if target not in allowed:
+            raise ValueError(
+                f"target scheme '{target}' is not valid for mode '{self.mode.value}' "
+                f"(expected: {', '.join(sorted(allowed))})"
+            )
+        return self

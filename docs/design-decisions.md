@@ -45,3 +45,32 @@ Connectivity checks will be a separate, explicit option.
 Unknown keys are rejected (`extra="forbid"`) so typos fail loudly instead of
 being silently ignored. The manifest `name` must be a slug because it will
 name checkpoint files and run folders.
+
+
+## 8. Schema discovery through SQLAlchemy reflection
+`polymorph inspect` uses SQLAlchemy's `Inspector`, so the same code reads
+tables, columns, primary keys and foreign keys from any supported database.
+Types are shown as the source database spells them (for example `UUID` on
+PostgreSQL and `CHAR(32)` on MySQL), which makes cross-database differences
+visible before a migration.
+
+## 9. Drivers are optional extras
+SQLAlchemy is a core dependency; database drivers are installed per need
+(`polymorph-etl[postgres]`, `polymorph-etl[mysql]`). Missing drivers produce
+an actionable error message instead of a stack trace.
+
+## 10. Source URLs come from the environment
+`inspect` reads `SOURCE_URL` by default. Passwords typed on the command line
+end up in shell history, so the environment variable is the recommended path.
+
+## 11. Foreign-key ordering with a topological sort
+Tables are listed parents-first using `graphlib.TopologicalSorter`. Self
+references are ignored; real cycles are reported as warnings because no safe
+load order exists for them.
+
+## 12. Safe-by-default file and database behaviour
+Row counts are exact by default (`--no-counts` for huge tables). Table names
+are quoted by SQLAlchemy. A mistyped SQLite path is an error instead of a
+silently created empty database. Draft manifests never overwrite an existing
+file without `--force`, and always use `${ENV_VAR}` placeholders for
+credentials.

@@ -13,3 +13,11 @@ target:
 
 settings:
   batch_size: 1000
+
+# Optional: omit this key to migrate every table.
+# Parents before children (foreign-key order).
+tables:
+  - customers
+  - customer_profiles
+  - orders
+  - order_items

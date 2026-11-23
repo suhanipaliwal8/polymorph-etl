@@ -11,3 +11,9 @@ target:
 
 settings:
   batch_size: 1000
+
+tables:
+  - customers
+  - customer_profiles
+  - orders
+  - order_items

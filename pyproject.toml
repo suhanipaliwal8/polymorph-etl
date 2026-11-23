@@ -12,12 +12,14 @@ dependencies = [
     "typer>=0.12",
     "pydantic>=2.6",
     "pyyaml>=6",
+    "sqlalchemy>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1", "cryptography>=42"]
 demo = [
-    "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
     "pymysql>=1.1",
     "cryptography>=42",
@@ -31,3 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # SQLite cannot store Decimal natively; SQLAlchemy warns when tests seed it.
+    "ignore:Dialect sqlite:sqlalchemy.exc.SAWarning",
+]
