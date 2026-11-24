@@ -97,3 +97,35 @@ text keys use the database's own collation consistently.
 and only then returns a generator, so errors surface at the call site rather
 than at the first iteration. Tables without a primary key are rejected
 explicitly instead of being read unsafely.
+
+
+## 17. One collection per table, primary key becomes `_id`
+Phase 5 copies tables flat. The primary key becomes `_id` and is not repeated
+as a field; composite keys become a subdocument whose fields always follow
+primary-key order (MongoDB compares subdocument ids field by field). Phase 8
+replaces the flat layout with folded documents.
+
+## 18. Idempotent bulk upserts with ReplaceOne
+Documents are written with unordered `ReplaceOne(..., upsert=True)`. Replace
+(not `$set`) means a re-run always restores the exact source state, with no
+stale fields. Unordered because each document is independent.
+
+## 19. Idempotency and checkpointing are different guarantees
+Idempotent writes make repeated work harmless (correctness). Checkpoints
+(Phase 9) make repeated work unnecessary (speed). Phase 5 delivers the first.
+
+## 20. Pre-flight checks before the first write
+Mode, tables, primary keys and the MongoDB connection are all verified before
+anything is written, so a configuration mistake never leaves a half-migrated
+target. Source and target connections are always released in a `finally` block.
+
+## 21. A deliberately temporary type bridge
+PyMongo cannot store `Decimal` or `UUID`, so a minimal bridge converts them
+(Decimal128, string). Known gaps (MySQL booleans as 0/1, millisecond
+datetimes, silent Decimal128 rounding beyond 34 digits) are documented in
+`docs/loading.md` and addressed by the Phase 6 translator.
+
+## 22. Test strategy for MongoDB
+Loader logic is unit-tested with a fake collection. End-to-end tests run
+against a real MongoDB in throwaway databases and skip automatically when
+none is reachable; CI will provide one through Testcontainers (Phase 15).
