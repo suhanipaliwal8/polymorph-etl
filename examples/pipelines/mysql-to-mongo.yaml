@@ -1,0 +1,25 @@
+# MySQL source: DATETIME columns carry no time zone, and a CHAR(32)
+# column holds UUIDs, so we give the tool two hints.
+version: 1
+name: shop-mysql-to-mongo
+mode: sql-to-nosql
+
+source:
+  url: ${SOURCE_URL}
+
+target:
+  url: ${TARGET_URL}
+
+settings:
+  batch_size: 1000
+  # How to read timestamps that have no time zone (stored as UTC in MongoDB).
+  naive_timestamp_timezone: UTC
+
+tables:
+  - customers
+  - customer_profiles
+  - orders
+  - order_items
+
+type_overrides:
+  customers.external_id: uuid
