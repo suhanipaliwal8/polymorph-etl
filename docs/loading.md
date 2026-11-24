@@ -32,14 +32,10 @@ Before the first write the pipeline verifies that: the mode is supported,
 every table exists and has a primary key, and MongoDB is reachable and the
 target URL names a database. A failure here changes nothing in the target.
 
-## Temporary type bridge
-PyMongo cannot store `Decimal` or `UUID`, so a minimal bridge converts:
-`Decimal` to `Decimal128`, `UUID` to string, `date` to datetime (midnight),
-`time` to an ISO string. The Phase 6 translator will replace it. Known gaps:
-- MySQL `TINYINT(1)` arrives as `1`/`0`, not `true`/`false`.
-- BSON datetimes keep milliseconds; Python keeps microseconds.
-- `Decimal128` holds 34 digits; wider values would be rounded silently until
-  Phase 6 adds an explicit check.
+## Types
+Values are converted by the schema-driven translator described in
+[`type-translation.md`](type-translation.md). The loader receives values that
+are already BSON-safe and only builds documents.
 
 ## Limits
 - A MongoDB document cannot exceed 16 MB.
