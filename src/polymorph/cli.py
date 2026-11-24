@@ -16,6 +16,14 @@ from polymorph.inspector import (
     render_text,
 )
 from polymorph.manifest import ManifestError, Mode, load_manifest, url_scheme
+from polymorph.mongo_loader import LoadError
+from polymorph.pipeline import (
+    TABLE_HEADER,
+    PipelineError,
+    format_footer,
+    format_table_row,
+    run_pipeline,
+)
 app = typer.Typer(
     name="polymorph",
     help="Schema-aware ETL and migration engine.",
@@ -191,3 +199,46 @@ def preview(
         raise _fail(str(exc)) from exc
     finally:
         engine.dispose()
+
+
+
+@app.command()
+def run(
+    manifest_path: Annotated[
+        Path, typer.Argument(help="Path to the pipeline YAML manifest.")
+    ],
+) -> None:
+    """Run a pipeline: read the source in batches and load it into the target."""
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        raise _fail(str(exc)) from exc
+
+    typer.echo(
+        f"Pipeline '{manifest.name}': {url_scheme(manifest.source.url)} -> "
+        f"{url_scheme(manifest.target.url)} ({manifest.mode.value})"
+    )
+
+    header_printed = False
+
+    def show_table(result) -> None:
+        nonlocal header_printed
+        if not header_printed:
+            typer.echo("")
+            typer.echo(TABLE_HEADER)
+            header_printed = True
+        typer.echo(format_table_row(result))
+
+    try:
+        summary = run_pipeline(manifest, on_table_done=show_table)
+    except (PipelineError, InspectError, ExtractError, LoadError) as exc:
+        if header_printed:
+            typer.echo(
+                "\nSome tables were already written. Re-running the same command "
+                "is safe: writes are idempotent.",
+                err=True,
+            )
+        raise _fail(str(exc)) from exc
+
+    typer.echo("")
+    typer.secho(format_footer(summary), fg=typer.colors.GREEN)
