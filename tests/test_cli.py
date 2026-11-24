@@ -153,3 +153,23 @@ def test_preview_requires_a_source_url(monkeypatch):
     monkeypatch.delenv("SOURCE_URL", raising=False)
     result = runner.invoke(app, ["preview", "customers"])
     assert result.exit_code == 2
+
+def test_run_requires_environment_variables(monkeypatch):
+    monkeypatch.delenv("SOURCE_URL", raising=False)
+    monkeypatch.delenv("TARGET_URL", raising=False)
+
+    result = runner.invoke(app, ["run", str(EXAMPLE)])
+
+    assert result.exit_code == 1
+    assert "SOURCE_URL" in result.output
+
+
+def test_run_rejects_sql_to_sql_until_it_is_implemented(monkeypatch):
+    monkeypatch.setenv("SOURCE_URL", "postgresql+psycopg://user:secret@localhost:5433/shop")
+    monkeypatch.setenv("TARGET_URL", "mysql+pymysql://user:secret@localhost:3307/shop")
+
+    result = runner.invoke(app, ["run", str(EXAMPLE.with_name("postgres-to-mysql.yaml"))])
+
+    assert result.exit_code == 1
+    assert "not available yet" in result.output
+    assert "secret" not in result.output

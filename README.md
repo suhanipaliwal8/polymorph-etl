@@ -25,7 +25,7 @@ crash-safe precision.
 - [x] Phase 2: CLI and pipeline manifest (`validate`)
 - [x] Phase 3: Schema discovery (`inspect`) and draft manifests
 - [x] Phase 4: Keyset streaming extractor
-- [ ] Phase 5: MongoDB bulk loader
+- [x] Phase 5: MongoDB bulk loader and first end-to-end run
 - [ ] Phase 6: Type and precision translator
 - [ ] Phase 7: Transform engine
 - [ ] Phase 8: Join folding
@@ -123,6 +123,33 @@ python -m polymorph.demo.pagination_benchmark --rows 500000
 ```
 
 See [`docs/extraction.md`](docs/extraction.md) for the design and limitations.
+
+### Run a migration
+
+```bash
+export SOURCE_URL="postgresql+psycopg://polymorph:polymorph@localhost:5433/shop"
+export TARGET_URL="mongodb://localhost:27018/shop"
+
+polymorph run examples/pipelines/postgres-to-mongo.yaml
+```
+
+```
+TABLE                          READ  CREATED  UPDATED  UNCHANGED     TIME
+customers                       200      200        0          0    0.10s
+...
+```
+
+Each table becomes a collection and its primary key becomes `_id`. Writes are
+**idempotent** (bulk `ReplaceOne` upserts): running the same pipeline twice
+creates no duplicates, and a re-run repairs deleted or stale documents.
+All checks (tables exist, primary keys, MongoDB reachable) happen before the
+first write.
+
+Current limits: only `sql-to-nosql`, flat collections, no transformations,
+and a minimal type bridge. See [`docs/loading.md`](docs/loading.md).
+
+Tests that need MongoDB are marked `integration` and are skipped when it is
+not running: `pytest -m "not integration"` runs only the fast ones.
 
 ## Tech stack
 
