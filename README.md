@@ -22,19 +22,20 @@ crash-safe precision.
 
 - [x] Phase 0: Project skeleton
 - [x] Phase 1: Demo databases (Docker Compose + seed data)
-- [x] Phase 2: CLI and pipeline manifest
+- [x] Phase 2: CLI and pipeline manifest (`validate`)
 - [x] Phase 3: Schema discovery (`inspect`) and draft manifests
-- [ ] Phase 4: MongoDB bulk loader
-- [ ] Phase 5: Type translator
-- [ ] Phase 6: Transform engine
-- [ ] Phase 7: Join folding
-- [ ] Phase 8: Checkpointing and resume
-- [ ] Phase 9: Dead-letter queue
-- [ ] Phase 10: Concurrency
-- [ ] Phase 11: Verification audit
-- [ ] Phase 12: SQL-to-SQL mode
-- [ ] Phase 13: One-command demo
-- [ ] Phase 14: Integration tests and CI
+- [x] Phase 4: Keyset streaming extractor
+- [ ] Phase 5: MongoDB bulk loader
+- [ ] Phase 6: Type and precision translator
+- [ ] Phase 7: Transform engine
+- [ ] Phase 8: Join folding
+- [ ] Phase 9: Checkpointing and resume
+- [ ] Phase 10: Dead-letter queue
+- [ ] Phase 11: Concurrency
+- [ ] Phase 12: Verification audit, run reports and dry run
+- [ ] Phase 13: SQL-to-SQL for any supported database
+- [ ] Phase 14: One-command demo
+- [ ] Phase 15: Integration tests and CI
 
 ## Demo databases
 
@@ -100,6 +101,28 @@ planned end-to-end workflow, run reports and exit codes.
 
 Special characters in passwords must be URL-encoded inside connection URLs
 (for example `@` becomes `%40`).
+
+### Preview source data
+
+```bash
+export SOURCE_URL="postgresql+psycopg://polymorph:polymorph@localhost:5433/shop"
+
+# First rows of a table as JSON lines (progress goes to stderr)
+polymorph preview customers --limit 5
+
+# See the batching: 25 rows read in batches of 10
+polymorph preview customers --limit 25 --batch-size 10
+```
+
+Tables are read with **keyset pagination** (`WHERE id > last_seen ORDER BY id
+LIMIT n`) instead of `OFFSET`, so every batch costs the same and reading can
+resume from the last key. Compare the two strategies yourself:
+
+```bash
+python -m polymorph.demo.pagination_benchmark --rows 500000
+```
+
+See [`docs/extraction.md`](docs/extraction.md) for the design and limitations.
 
 ## Tech stack
 
