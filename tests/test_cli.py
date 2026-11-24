@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -121,3 +122,34 @@ def test_inspect_fails_with_exit_code_1_for_a_non_sql_url():
     result = runner.invoke(app, ["inspect", "mongodb://localhost:27018/shop"])
     assert result.exit_code == 1
     assert "SQL" in result.output
+
+def test_preview_prints_rows_as_json_lines(shop_url):
+    result = runner.invoke(
+        app, ["preview", "customers", "--limit", "3"], env={"SOURCE_URL": shop_url}
+    )
+    assert result.exit_code == 0
+    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    assert [json.loads(line)["id"] for line in lines] == [1, 2, 3]
+
+
+def test_preview_stops_at_the_limit_across_batches(shop_url):
+    result = runner.invoke(
+        app,
+        ["preview", "customers", "--limit", "5", "--batch-size", "2"],
+        env={"SOURCE_URL": shop_url},
+    )
+    assert result.exit_code == 0
+    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    assert [json.loads(line)["id"] for line in lines] == [1, 2, 3, 4, 5]
+
+
+def test_preview_unknown_table_exits_with_code_1(shop_url):
+    result = runner.invoke(app, ["preview", "nope"], env={"SOURCE_URL": shop_url})
+    assert result.exit_code == 1
+    assert "not found" in result.output
+
+
+def test_preview_requires_a_source_url(monkeypatch):
+    monkeypatch.delenv("SOURCE_URL", raising=False)
+    result = runner.invoke(app, ["preview", "customers"])
+    assert result.exit_code == 2
