@@ -74,3 +74,26 @@ are quoted by SQLAlchemy. A mistyped SQLite path is an error instead of a
 silently created empty database. Draft manifests never overwrite an existing
 file without `--force`, and always use `${ENV_VAR}` placeholders for
 credentials.
+
+
+## 13. Keyset pagination instead of OFFSET
+Each batch is `WHERE key > cursor ORDER BY key LIMIT n`. Cost per batch stays
+constant, rows are not skipped or duplicated when the source changes during a
+run, and the cursor is exactly what a checkpoint needs to store. A benchmark
+(`polymorph.demo.pagination_benchmark`) makes the difference measurable.
+
+## 14. One short transaction per batch, no server-side cursor
+A streaming cursor would hold one transaction open for the whole migration
+and could not be resumed after a crash. Per-batch queries release their
+connection before the batch is handed to the consumer.
+
+## 15. Composite and non-integer keys
+Composite keys use `a > x OR (a = x AND b > y)` because row-value comparison
+is not supported everywhere. Ordering and comparison stay in the database, so
+text keys use the database's own collation consistently.
+
+## 16. Fail fast, then stream
+`extract_batches` validates (table exists, has a primary key, cursor matches)
+and only then returns a generator, so errors surface at the call site rather
+than at the first iteration. Tables without a primary key are rejected
+explicitly instead of being read unsafely.

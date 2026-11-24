@@ -1,5 +1,6 @@
 """Command-line interface for PolyMorph ETL."""
 
+import json
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -7,9 +8,14 @@ import typer
 
 from polymorph import __version__
 from polymorph.draft import render_manifest_draft
-from polymorph.inspector import InspectError, inspect_database, render_text
+from polymorph.extractor import ExtractError, extract_batches
+from polymorph.inspector import (
+    InspectError,
+    create_source_engine,
+    inspect_database,
+    render_text,
+)
 from polymorph.manifest import ManifestError, Mode, load_manifest, url_scheme
-
 app = typer.Typer(
     name="polymorph",
     help="Schema-aware ETL and migration engine.",
@@ -131,3 +137,57 @@ def inspect_command(
 
     typer.secho(f"\nDraft manifest written to {generate_manifest}", fg=typer.colors.GREEN)
     typer.echo(f"Next: review it, then run: polymorph validate {generate_manifest}")
+
+
+
+@app.command()
+def preview(
+    table_name: Annotated[str, typer.Argument(metavar="TABLE", help="Table to read.")],
+    source_url: Annotated[
+        str,
+        typer.Option(
+            "--source-url",
+            envvar="SOURCE_URL",
+            show_default=False,
+            help="Source database URL (or set the SOURCE_URL environment variable).",
+        ),
+    ],
+    limit: Annotated[
+        int, typer.Option("--limit", min=1, help="Maximum number of rows to print.")
+    ] = 5,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", min=1, help="Rows fetched per query.")
+    ] = 1000,
+    schema: Annotated[
+        Optional[str],
+        typer.Option("--schema", help="Database schema (default schema if omitted)."),
+    ] = None,
+) -> None:
+    """Print the first rows of a table as JSON lines, read with keyset pagination.
+
+    Rows go to stdout; per-batch progress goes to stderr, so output stays pipeable.
+    """
+    try:
+        engine = create_source_engine(source_url)
+    except InspectError as exc:
+        raise _fail(str(exc)) from exc
+
+    printed = 0
+    try:
+        batches = extract_batches(
+            engine, table_name, batch_size=min(batch_size, limit), schema=schema
+        )
+        for number, batch in enumerate(batches, start=1):
+            typer.echo(
+                f"-- batch {number}: {len(batch.rows)} rows fetched, cursor={batch.cursor}",
+                err=True,
+            )
+            for row in batch.rows:
+                typer.echo(json.dumps(row, default=str, ensure_ascii=False))
+                printed += 1
+                if printed >= limit:
+                    return
+    except ExtractError as exc:
+        raise _fail(str(exc)) from exc
+    finally:
+        engine.dispose()
