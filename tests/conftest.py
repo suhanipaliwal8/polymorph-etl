@@ -52,7 +52,10 @@ def mongo_target():
         client.admin.command("ping")
     except PyMongoError:
         client.close()
-        pytest.skip("MongoDB is not reachable (start it with: docker compose up -d)")
+        message = "MongoDB is not reachable (start it with: docker compose up -d)"
+        if os.environ.get("POLYMORPH_REQUIRE_MONGO"):
+            pytest.fail(message)  # CI: a missing MongoDB must be a failure, not a skip
+        pytest.skip(message)
 
     name = f"polymorph_test_{uuid.uuid4().hex[:8]}"
     try:

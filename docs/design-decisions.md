@@ -129,3 +129,12 @@ datetimes, silent Decimal128 rounding beyond 34 digits) are documented in
 Loader logic is unit-tested with a fake collection. End-to-end tests run
 against a real MongoDB in throwaway databases and skip automatically when
 none is reachable; CI will provide one through Testcontainers (Phase 15).
+
+## 23. Continuous integration from the start of the engine
+GitHub Actions runs the full suite on every pull request across Python
+3.11-3.13 with a MongoDB service container. In CI a missing MongoDB fails the
+build (`POLYMORPH_REQUIRE_MONGO=1`) instead of silently skipping integration
+tests, so a green check always means those tests really ran. Jobs get
+read-only repository permissions and superseded runs are cancelled. Real
+PostgreSQL/MySQL service containers are added with the Phase 15 integration
+tests.

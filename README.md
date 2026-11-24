@@ -1,5 +1,7 @@
 # PolyMorph ETL
 
+[![CI](https://github.com/suhanipaliwal8/polymorph-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/suhanipaliwal8/polymorph-etl/actions/workflows/ci.yml)
+
 Schema-aware CLI ETL and migration engine that extracts relational data,
 reshapes it, and loads it into denormalized document stores with
 crash-safe precision.
@@ -35,7 +37,7 @@ crash-safe precision.
 - [ ] Phase 12: Verification audit, run reports and dry run
 - [ ] Phase 13: SQL-to-SQL for any supported database
 - [ ] Phase 14: One-command demo
-- [ ] Phase 15: Integration tests and CI
+- [ ] Phase 15: Integration tests against real PostgreSQL and MySQL in CI, final polish
 
 ## Demo databases
 
@@ -150,6 +152,20 @@ and a minimal type bridge. See [`docs/loading.md`](docs/loading.md).
 
 Tests that need MongoDB are marked `integration` and are skipped when it is
 not running: `pytest -m "not integration"` runs only the fast ones.
+
+## Continuous integration
+
+Every pull request and every push to `main` runs the test suite on Python
+3.11, 3.12 and 3.13 with a real MongoDB service container
+(`.github/workflows/ci.yml`). The MongoDB integration tests must run in CI:
+if MongoDB is unreachable there, the build fails instead of skipping them.
+
+Reproduce CI locally:
+
+```bash
+docker compose up -d mongo
+POLYMORPH_REQUIRE_MONGO=1 pytest -ra --strict-markers
+```
 
 ## Tech stack
 
