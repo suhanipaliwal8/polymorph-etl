@@ -30,6 +30,7 @@ def make_manifest():
         mode="sql-to-nosql",
         type_overrides=None,
         settings=None,
+        transforms=None,
     ) -> Manifest:
         data = {
             "version": 1,
@@ -43,9 +44,54 @@ def make_manifest():
             data["tables"] = tables
         if type_overrides is not None:
             data["type_overrides"] = type_overrides
+        if transforms is not None:
+            data["transforms"] = transforms
         return Manifest.model_validate(data)
 
     return build
+
+
+@pytest.fixture()
+def masking_rules():
+    """The same rules as examples/pipelines/postgres-to-mongo-masked.yaml."""
+    return {
+        "customers": [
+            {
+                "type": "normalize",
+                "fields": ["name", "email"],
+                "ops": ["nfc", "collapse_whitespace", "nullify_empty"],
+            },
+            {"type": "normalize", "fields": ["email"], "ops": ["lower"]},
+            {
+                "type": "require",
+                "expression": "name is not None",
+                "message": "customer name must not be blank",
+            },
+            {
+                "type": "require",
+                "expression": "email is not None",
+                "message": "customer email is required",
+            },
+            {"type": "hash", "field": "email", "into": "email_hash", "salt": "unit-test-salt"},
+            {"type": "mask", "field": "email", "style": "email"},
+            {"type": "rename", "mapping": {"is_active": "active"}},
+        ],
+        "customer_profiles": [{"type": "filter", "expression": "loyalty_tier != 'bronze'"}],
+        "orders": [
+            {
+                "type": "compute",
+                "into": "total_with_tax",
+                "expression": "round(total_amount * decimal('1.18'), 2)",
+            }
+        ],
+        "order_items": [
+            {
+                "type": "require",
+                "expression": "quantity > 0",
+                "message": "quantity must be positive",
+            }
+        ],
+    }
 
 
 @pytest.fixture()

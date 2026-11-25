@@ -1,18 +1,27 @@
-"""End-to-end pipeline execution: extract, translate types, load."""
+"""End-to-end pipeline execution: extract, translate types, transform, load."""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from pymongo.errors import InvalidName
 
 from polymorph.extractor import ExtractError, extract_batches, reflect_table
 from polymorph.inspector import create_source_engine, inspect_database
-from polymorph.manifest import Manifest, Mode
+from polymorph.manifest import Manifest, Mode, RowErrorPolicy
 from polymorph.mongo_loader import LoadStats, build_document, connect, write_documents
+from polymorph.transform import (
+    RowRejected,
+    TransformConfigError,
+    TransformPlan,
+    build_transform_plan,
+)
 from polymorph.translate import TranslationError, Translator, build_translator
+
+MAX_REJECTION_SAMPLES = 10
 
 
 class PipelineError(Exception):
@@ -27,6 +36,9 @@ class TableResult:
     updated: int
     unchanged: int
     seconds: float
+    filtered: int = 0
+    rejected: int = 0
+    rejection_samples: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -41,30 +53,58 @@ class RunSummary:
     def rows_read(self) -> int:
         return sum(table.rows_read for table in self.tables)
 
+    @property
+    def filtered(self) -> int:
+        return sum(table.filtered for table in self.tables)
+
+    @property
+    def rejected(self) -> int:
+        return sum(table.rejected for table in self.tables)
+
 
 @dataclass(frozen=True)
 class TablePlan:
     name: str
     pk_names: list[str]
     translator: Translator
+    transform: TransformPlan
+
+
+@dataclass(frozen=True)
+class RowOutcome:
+    """What happened to one row.
+
+    document set      -> the row is ready to load
+    rejection set     -> the row is invalid (the message explains why)
+    both None         -> a filter rule dropped the row
+    """
+
+    document: dict[str, Any] | None = None
+    rejection: str | None = None
 
 
 TABLE_HEADER = (
-    f"{'TABLE':<26}{'READ':>9}{'CREATED':>9}{'UPDATED':>9}{'UNCHANGED':>11}{'TIME':>9}"
+    f"{'TABLE':<26}{'READ':>9}{'FILTERED':>10}{'REJECTED':>10}"
+    f"{'CREATED':>9}{'UPDATED':>9}{'UNCHANGED':>11}{'TIME':>9}"
 )
 
 
 def format_table_row(result: TableResult) -> str:
     return (
-        f"{result.table:<26}{result.rows_read:>9,}{result.created:>9,}"
-        f"{result.updated:>9,}{result.unchanged:>11,}{result.seconds:>8.2f}s"
+        f"{result.table:<26}{result.rows_read:>9,}{result.filtered:>10,}{result.rejected:>10,}"
+        f"{result.created:>9,}{result.updated:>9,}{result.unchanged:>11,}{result.seconds:>8.2f}s"
     )
 
 
 def format_footer(summary: RunSummary) -> str:
+    parts = [f"Done: {len(summary.tables)} table(s), {summary.rows_read:,} rows read"]
+    if summary.filtered:
+        parts.append(f"{summary.filtered:,} filtered")
+    if summary.rejected:
+        parts.append(f"{summary.rejected:,} rejected")
     return (
-        f"Done: {len(summary.tables)} table(s), {summary.rows_read:,} rows in "
-        f"{summary.seconds:.2f}s -> MongoDB database '{summary.target_database}'"
+        f"{', '.join(parts)} in {summary.seconds:.2f}s "
+        f"-> MongoDB database '{summary.target_database}'"
     )
 
 
@@ -102,12 +142,22 @@ def run_pipeline(
                 ) from exc
 
         if on_plan is not None:
-            on_plan([note for plan in plans for note in plan.translator.notes])
+            on_plan(
+                [
+                    note
+                    for plan in plans
+                    for note in (*plan.translator.notes, *plan.transform.notes)
+                ]
+            )
 
         results = []
         for plan in plans:
             result = _copy_table(
-                source, collections[plan.name], plan, manifest.settings.batch_size
+                source,
+                collections[plan.name],
+                plan,
+                manifest.settings.batch_size,
+                manifest.settings.on_row_error,
             )
             results.append(result)
             if on_table_done is not None:
@@ -134,63 +184,103 @@ def _discover_tables(url: str) -> list[str]:
 
 
 def _plan_tables(source, names: list[str], manifest: Manifest) -> list[TablePlan]:
-    overrides_by_table: dict[str, dict[str, str]] = {}
+    migrated = set(names)
+    references = {
+        "type_overrides": {key.split(".", 1)[0] for key in manifest.type_overrides},
+        "transforms": set(manifest.transforms),
+    }
+    for section, tables in references.items():
+        missing = sorted(tables - migrated)
+        if missing:
+            raise PipelineError(
+                f"{section} refers to table(s) that are not being migrated: {', '.join(missing)}"
+            )
+    return [plan_table(source, name, manifest) for name in names]
+
+
+def plan_table(source, name: str, manifest: Manifest) -> TablePlan:
+    """Reflect one table and validate everything that will be applied to it."""
+    table = reflect_table(source, name)
+    pk_names = [column.name for column in table.primary_key.columns]
+    if not pk_names:
+        raise ExtractError(
+            f"Table '{name}' has no primary key; keyset pagination "
+            "needs a unique, ordered key"
+        )
+    column_names = [column.name for column in table.columns]
+
+    overrides: dict[str, str] = {}
     for key, kind in manifest.type_overrides.items():
         table_name, column_name = key.split(".", 1)
-        overrides_by_table.setdefault(table_name, {})[column_name] = kind.value
-
-    not_migrated = sorted(set(overrides_by_table) - set(names))
-    if not_migrated:
+        if table_name == name:
+            overrides[column_name] = kind.value
+    unknown = sorted(set(overrides) - set(column_names))
+    if unknown:
         raise PipelineError(
-            "type_overrides refers to table(s) that are not being migrated: "
-            + ", ".join(not_migrated)
+            f"type_overrides refers to unknown column(s) of '{name}': {', '.join(unknown)}"
         )
 
-    naive_tz = manifest.settings.naive_tz
-    plans = []
-    for name in names:
-        table = reflect_table(source, name)
-        pk_names = [column.name for column in table.primary_key.columns]
-        if not pk_names:
-            raise ExtractError(
-                f"Table '{name}' has no primary key; keyset pagination "
-                "needs a unique, ordered key"
-            )
+    translator = build_translator(table, source.dialect, manifest.settings.naive_tz, overrides)
+    try:
+        transform = build_transform_plan(
+            name, column_names, pk_names, manifest.transforms.get(name, [])
+        )
+    except TransformConfigError as exc:
+        raise PipelineError(str(exc)) from exc
 
-        column_names = {column.name for column in table.columns}
-        if "_id" in column_names and "_id" not in pk_names:
-            raise PipelineError(
-                f"Table '{name}' has a column named '_id' that is not its primary key; "
-                "it would collide with MongoDB's _id field"
-            )
-
-        overrides = overrides_by_table.get(name, {})
-        unknown = sorted(set(overrides) - column_names)
-        if unknown:
-            raise PipelineError(
-                f"type_overrides refers to unknown column(s) of '{name}': {', '.join(unknown)}"
-            )
-
-        translator = build_translator(table, source.dialect, naive_tz, overrides)
-        plans.append(TablePlan(name=name, pk_names=pk_names, translator=translator))
-    return plans
+    return TablePlan(name=name, pk_names=pk_names, translator=translator, transform=transform)
 
 
-def _copy_table(source, collection, plan: TablePlan, batch_size: int) -> TableResult:
+def _row_key(plan: TablePlan, row: Mapping[str, Any]) -> str:
+    return ", ".join(f"{name}={row[name]!r}" for name in plan.pk_names)
+
+
+def process_row(plan: TablePlan, row: Mapping[str, Any]) -> RowOutcome:
+    """Translate types, apply the transform rules and build the document for one row."""
+    try:
+        translated = plan.translator.translate_row(row)
+    except TranslationError as exc:
+        # A type error means the data does not match its schema: always fatal.
+        raise PipelineError(f"{exc} (row {_row_key(plan, row)})") from exc
+
+    try:
+        kept = plan.transform.apply(translated)
+    except RowRejected as exc:
+        return RowOutcome(rejection=f"{plan.name}: {exc} (row {_row_key(plan, row)})")
+
+    if kept is None:
+        return RowOutcome()
+    return RowOutcome(document=build_document(kept, plan.pk_names))
+
+
+def _copy_table(
+    source, collection, plan: TablePlan, batch_size: int, on_row_error: RowErrorPolicy
+) -> TableResult:
     started = time.perf_counter()
-    rows_read = 0
+    rows_read = filtered = rejected = 0
+    samples: list[str] = []
     stats = LoadStats(0, 0, 0)
 
     for batch in extract_batches(source, plan.name, batch_size=batch_size):
         documents = []
         for row in batch.rows:
-            try:
-                translated = plan.translator.translate_row(row)
-            except TranslationError as exc:
-                key = ", ".join(f"{name}={row[name]!r}" for name in plan.pk_names)
-                raise PipelineError(f"{exc} (row {key})") from exc
-            documents.append(build_document(translated, plan.pk_names))
+            outcome = process_row(plan, row)
+            if outcome.rejection is not None:
+                if on_row_error is RowErrorPolicy.FAIL:
+                    raise PipelineError(
+                        f"{outcome.rejection}. Set settings.on_row_error: skip "
+                        "to continue past rejected rows."
+                    )
+                rejected += 1
+                if len(samples) < MAX_REJECTION_SAMPLES:
+                    samples.append(outcome.rejection)
+            elif outcome.document is None:
+                filtered += 1
+            else:
+                documents.append(outcome.document)
 
+        # A batch is written only after every row in it was processed, so a
+        # failing batch is never half-loaded.
         stats += write_documents(collection, documents)
         rows_read += len(batch.rows)
 
@@ -201,4 +291,7 @@ def _copy_table(source, collection, plan: TablePlan, batch_size: int) -> TableRe
         updated=stats.updated,
         unchanged=stats.unchanged,
         seconds=time.perf_counter() - started,
+        filtered=filtered,
+        rejected=rejected,
+        rejection_samples=tuple(samples),
     )

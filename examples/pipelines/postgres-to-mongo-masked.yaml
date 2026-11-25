@@ -1,0 +1,65 @@
+# Pipeline with transform rules: PII masking and hashing, normalisation,
+# validation, a filter and a computed field. See docs/transforms.md.
+version: 1
+name: shop-masked
+mode: sql-to-nosql
+
+source:
+  url: ${SOURCE_URL}
+
+target:
+  url: ${TARGET_URL}
+
+settings:
+  batch_size: 1000
+  # fail (default): stop at the first rejected row.
+  # skip: count rejected rows, load the rest, and exit with code 3.
+  on_row_error: skip
+
+tables:
+  - customers
+  - customer_profiles
+  - orders
+  - order_items
+
+transforms:
+  customers:
+    - type: normalize
+      fields: [name, email]
+      ops: [nfc, collapse_whitespace, nullify_empty]
+    - type: normalize
+      fields: [email]
+      ops: [lower]
+    - type: require
+      expression: name is not None
+      message: customer name must not be blank
+    - type: require
+      expression: email is not None
+      message: customer email is required
+    # Keep a stable pseudonym of the email, then mask the email itself.
+    - type: hash
+      field: email
+      into: email_hash
+      salt: ${HASH_SALT}
+    - type: mask
+      field: email
+      style: email
+    - type: rename
+      mapping:
+        is_active: active
+
+  # customer_profiles is a leaf table (nothing refers to it), so filtering it
+  # cannot leave orphaned rows behind.
+  customer_profiles:
+    - type: filter
+      expression: loyalty_tier != 'bronze'
+
+  orders:
+    - type: compute
+      into: total_with_tax
+      expression: round(total_amount * decimal('1.18'), 2)
+
+  order_items:
+    - type: require
+      expression: quantity > 0
+      message: quantity must be positive

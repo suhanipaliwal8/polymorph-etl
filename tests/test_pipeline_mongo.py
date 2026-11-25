@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 import uuid
@@ -17,6 +18,12 @@ pytestmark = pytest.mark.integration  # needs MongoDB; skipped automatically if 
 
 EXAMPLE = (
     Path(__file__).resolve().parent.parent / "examples" / "pipelines" / "postgres-to-mongo.yaml"
+)
+MASKED_EXAMPLE = (
+    Path(__file__).resolve().parent.parent
+    / "examples"
+    / "pipelines"
+    / "postgres-to-mongo-masked.yaml"
 )
 
 
@@ -162,3 +169,101 @@ def test_translation_errors_name_the_table_column_and_row(
         run_pipeline(make_manifest(f"sqlite:///{path.as_posix()}", target_url))
 
     assert db.list_collection_names() == []  # the failing batch was never written
+
+def source_scalar(url, sql):
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text(sql)).scalar_one()
+    finally:
+        engine.dispose()
+
+
+def test_masked_pipeline_skips_poison_rows_and_redacts_pii(
+    shop_url, mongo_target, make_manifest, masking_rules
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url, target_url, transforms=masking_rules, settings={"on_row_error": "skip"}
+    )
+
+    summary = run_pipeline(manifest)
+    results = {table.table: table for table in summary.tables}
+
+    # Poison customers 13, 27 and 41 are rejected, everyone else is loaded.
+    assert results["customers"].rejected == 3
+    assert db.customers.count_documents({}) == 47
+    assert db.customers.count_documents({"_id": {"$in": [13, 27, 41]}}) == 0
+
+    # No plain-text email survived, and the hash and rename were applied.
+    assert db.customers.count_documents({"email": {"$not": re.compile(r"\*\*\*")}}) == 0
+    customer = db.customers.find_one({"_id": 1})
+    assert isinstance(customer["active"], bool)
+    assert len(customer["email_hash"]) == 64
+
+    # The leaf table is filtered, not rejected.
+    bronze = source_scalar(
+        shop_url, "SELECT COUNT(*) FROM customer_profiles WHERE loyalty_tier = 'bronze'"
+    )
+    assert results["customer_profiles"].filtered == bronze
+    assert results["customer_profiles"].rejected == 0
+    assert db.customer_profiles.count_documents({"loyalty_tier": "bronze"}) == 0
+
+    # Item 5 has a negative quantity; computed fields are exact decimals.
+    assert results["order_items"].rejected == 1
+    assert db.order_items.find_one({"_id": 5}) is None
+    assert isinstance(db.orders.find_one()["total_with_tax"], Decimal128)
+
+    # Every row is accounted for.
+    for table in summary.tables:
+        assert table.rows_read == (
+            table.filtered + table.rejected + table.created + table.updated + table.unchanged
+        )
+
+
+def test_the_default_policy_stops_at_the_first_rejected_row(
+    shop_url, mongo_target, make_manifest, masking_rules
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(shop_url, target_url, transforms=masking_rules)
+
+    with pytest.raises(PipelineError, match=r"id=13.*on_row_error"):
+        run_pipeline(manifest)
+
+    # Batch size is 7: ids 1-7 were written, the batch with id 13 was not.
+    assert db.customers.count_documents({}) == 7
+
+
+def test_rerunning_a_masked_pipeline_changes_nothing(
+    shop_url, mongo_target, make_manifest, masking_rules
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url, target_url, transforms=masking_rules, settings={"on_row_error": "skip"}
+    )
+
+    run_pipeline(manifest)
+    second = run_pipeline(manifest)
+
+    assert db.customers.count_documents({}) == 47
+    assert all(table.created == 0 for table in second.tables)
+    # Salted hashes are deterministic, so nothing is rewritten.
+    assert all(table.updated == 0 for table in second.tables)
+
+
+def test_cli_run_exits_with_code_3_when_rows_were_rejected(shop_url, mongo_target):
+    target_url, _ = mongo_target
+
+    result = CliRunner().invoke(
+        app,
+        ["run", str(MASKED_EXAMPLE)],
+        env={
+            "SOURCE_URL": shop_url,
+            "TARGET_URL": target_url,
+            "HASH_SALT": "unit-test-salt",
+        },
+    )
+
+    assert result.exit_code == 3
+    assert "REJECTED" in result.output
+    assert "customer email is required" in result.output

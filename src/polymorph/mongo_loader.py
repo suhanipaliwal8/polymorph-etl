@@ -86,7 +86,7 @@ def build_document(row: Mapping[str, Any], pk_names: Sequence[str]) -> dict[str,
     if "_id" in row and "_id" not in pk_names:
         raise LoadError(
             "A source column named '_id' collides with MongoDB's own _id field; "
-            "rename it in the source or wait for the rename transform (Phase 7)"
+            "rename it with a 'rename' transform rule"
         )
 
     if len(pk_names) == 1:
