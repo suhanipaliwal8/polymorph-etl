@@ -69,7 +69,7 @@ Possible `status` values: `completed`, `completed_with_rejects`, `failed`,
 | 0 | Success |
 | 1 | Error (invalid manifest, failed run) |
 | 2 | Command-line usage error |
-| 3 | Run finished, but with rejected rows or verification mismatches (planned) |
+| 3 | Run finished, but rows were rejected (`on_row_error: skip`); verification mismatches will use it too (Phase 12) |
 
 ## Secrets
 Connection URLs are read from environment variables (`${SOURCE_URL}` in the

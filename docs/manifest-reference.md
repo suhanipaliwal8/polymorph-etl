@@ -11,6 +11,8 @@
 | `tables` | no (all) | Tables to migrate, parents before children (foreign-key order). Must be non-empty and unique. |
 | `settings.naive_timestamp_timezone` | no (`UTC`) | IANA zone (e.g. `Asia/Kolkata`) used to read timestamps that carry no time zone. They are stored as UTC. |
 | `type_overrides` | no | Map of `table.column` to `uuid`, `boolean` or `string`; see `type-translation.md`. |
+| `settings.on_row_error` | no (`fail`) | `fail` stops at the first rejected row; `skip` counts rejected rows, loads the rest and exits with code 3. |
+| `transforms` | no | Map of table name to a list of rules (`rename`, `drop`, `normalize`, `mask`, `hash`, `compute`, `filter`, `require`). See `transforms.md`. |
 
 ## Connection URLs
 The URL scheme selects the database engine and the Python driver:
