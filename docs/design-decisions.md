@@ -138,3 +138,33 @@ tests, so a green check always means those tests really ran. Jobs get
 read-only repository permissions and superseded runs are cancelled. Real
 PostgreSQL/MySQL service containers are added with the Phase 15 integration
 tests.
+
+## 24. Types are translated from the reflected column type
+A translator is planned once per table from the reflected SQL types and then
+applied to every row. This replaces the Phase 5 bridge, which guessed from
+Python values. The mapping is unit-tested for PostgreSQL and MySQL types
+without any database by compiling against SQLAlchemy dialect objects.
+
+## 25. Exactness over convenience
+Decimals become Decimal128 and are rejected beyond 34 digits; floats are never
+accepted as decimals; integers outside 64 bits are rejected. A wrong or
+oversized value stops the run with a clear message rather than being altered.
+
+## 26. The tool never guesses a time zone
+A timestamp without a zone is read in `settings.naive_timestamp_timezone`
+(default `UTC`) and every such column is announced in the run output.
+Sub-millisecond digits are truncated explicitly, because BSON dates hold
+milliseconds.
+
+## 27. Overrides for what a type cannot express
+`type_overrides` (`table.column: uuid | boolean | string`) tells the tool how
+to read a column whose meaning is not visible in its type, such as a
+`CHAR(32)` holding UUIDs. Unknown tables or columns are rejected in
+pre-flight.
+
+## 28. Type errors and business-rule errors are different
+A text value in an integer column is a translation error and stops the run;
+the message names the table, column and primary key but never the value, which
+may be personal data. Values that are valid for their type but bad for the
+business (an invalid email) are handled by transforms and the dead-letter
+queue in later phases.
