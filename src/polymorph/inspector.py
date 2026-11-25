@@ -148,7 +148,7 @@ def _describe_table(
     columns = tuple(
         ColumnInfo(
             name=col["name"],
-            type=_type_name(col["type"], conn.dialect),
+            type=type_name(col["type"], conn.dialect),
             nullable=bool(col["nullable"]),
         )
         for col in insp.get_columns(name, schema=schema)
@@ -177,7 +177,7 @@ def _describe_table(
     )
 
 
-def _type_name(sql_type: object, dialect: Dialect) -> str:
+def type_name(sql_type: object, dialect: Dialect) -> str:
     """Show the column type the way this database spells it (NUMERIC(19, 4), UUID...)."""
     try:
         return sql_type.compile(dialect=dialect)  # type: ignore[attr-defined]
