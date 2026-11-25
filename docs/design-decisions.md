@@ -168,3 +168,53 @@ the message names the table, column and primary key but never the value, which
 may be personal data. Values that are valid for their type but bad for the
 business (an invalid email) are handled by transforms and the dead-letter
 queue in later phases.
+
+## 29. Transforms run after type translation
+Rules receive clean, BSON-safe values. Expressions see `Decimal128` as an
+exact `Decimal`, so money arithmetic stays exact, and results are converted
+back to BSON before loading.
+
+## 30. Rules are validated three times
+The manifest checks the shape of each rule and the syntax of its expressions;
+a pre-flight pass checks field names against the real table while tracking
+how earlier rules change the field set (a renamed field has only its new
+name); the runtime applies the rule to each row. Typos are caught before any
+write, with a "did you mean" hint.
+
+## 31. A safe expression language instead of `eval`
+Expressions are parsed with `ast`, checked against a whitelist of node types
+and functions, and run by a small interpreter. Attribute access, lambdas,
+comprehensions, `**`, text repetition and `%` formatting are refused.
+Runtime failures report only the exception class, never the data.
+
+## 32. Filtered, rejected and `on_row_error`
+A filter drops rows on purpose; a rejection means the row is invalid.
+`fail` (default) stops at the first rejection; `skip` counts and continues and
+the run exits with code 3 so scripts notice. A batch is written only after
+all its rows were processed. Type errors always stop the run; the dead-letter
+queue (Phase 10) will record rejected rows.
+
+## 33. Primary keys are not transformable
+`_id` and resume cursors depend on them, so rename, drop and in-place
+masking, hashing or normalising are refused for primary key columns. A hash
+may still be written to a new field. A non-key column named `_id` must be
+renamed.
+
+## 34. Privacy defaults
+Salted hashes use HMAC-SHA256 with the salt taken from the environment;
+unsalted hashes work but are announced. Partial masks never reveal more than
+half of a value. Rejection messages contain the table, field, reason and
+primary key, never the value.
+
+## 35. Rules are a discriminated union
+Each rule is a Pydantic model selected by its `type` key. The manifest, the
+pre-flight checks and the pipeline need no change to support a new rule: add a
+class with `check()` and `apply()` and list it in the `Rule` union.
+
+## 36. `preview --manifest` as the feedback loop
+Showing the exact documents a pipeline would produce makes rules easy to
+write and review, and gives the CLI an end-to-end test that needs no MongoDB.
+
+## 37. URL helpers live in their own module
+`polymorph.urls` removes a circular import between the manifest (which now
+imports the transform rules) and the inspector.

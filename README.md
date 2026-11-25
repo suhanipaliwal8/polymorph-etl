@@ -29,7 +29,7 @@ crash-safe precision.
 - [x] Phase 4: Keyset streaming extractor
 - [x] Phase 5: MongoDB bulk loader and first end-to-end run
 - [x] Phase 6: Type and precision translator
-- [ ] Phase 7: Transform engine
+- [x] Phase 7: Transform engine
 - [ ] Phase 8: Join folding
 - [ ] Phase 9: Checkpointing and resume
 - [ ] Phase 10: Dead-letter queue
@@ -169,6 +169,47 @@ Timestamps without a time zone (for example MySQL `DATETIME`) are read in
 alone cannot say. The same data migrated from PostgreSQL and from MySQL
 produces identical MongoDB documents. See
 [`docs/type-translation.md`](docs/type-translation.md).
+
+### Transform rows
+
+Declarative rules run between type translation and loading: `rename`,
+`drop`, `normalize`, `mask`, `hash`, `compute`, `filter` and `require`.
+
+```yaml
+settings:
+  on_row_error: skip        # fail (default) | skip
+
+transforms:
+  customers:
+    - type: require
+      expression: email is not None
+      message: customer email is required
+    - type: hash
+      field: email
+      into: email_hash
+      salt: ${HASH_SALT}
+    - type: mask
+      field: email
+      style: email          # asha@example.com -> a***@***.com
+```
+
+```bash
+export HASH_SALT="a-long-secret"
+
+# See the documents MongoDB would receive, without writing anything
+polymorph preview customers --manifest examples/pipelines/postgres-to-mongo-masked.yaml
+
+polymorph run examples/pipelines/postgres-to-mongo-masked.yaml
+```
+
+Rows a `filter` drops are **filtered**; invalid rows are **rejected**. With
+`on_row_error: skip` rejected rows are counted and the run exits with code
+**3**; by default the run stops at the first one. Every row is accounted for:
+`read = filtered + rejected + created + updated + unchanged`.
+
+Expressions use a small, safe language (no `eval`). See
+[`docs/transforms.md`](docs/transforms.md) for every rule, the expression
+reference and the limits.
 
 ## Continuous integration
 
