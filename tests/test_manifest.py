@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from polymorph.manifest import ManifestError, Mode, TypeOverride, load_manifest, url_scheme
+from polymorph.manifest import (
+    ManifestError,
+    Mode,
+    RowErrorPolicy,
+    TypeOverride,
+    load_manifest,
+    url_scheme,
+)
 
 POSTGRES = "postgresql+psycopg://user:secret@localhost:5433/shop"
 MYSQL = "mysql+pymysql://user:secret@localhost:3307/shop"

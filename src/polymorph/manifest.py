@@ -20,8 +20,8 @@ from pydantic import (
     model_validator,
 )
 
-SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "sqlite", "mssql", "oracle"}
-NOSQL_SCHEMES = {"mongodb", "mongodb+srv"}
+from polymorph.transform import Rule
+from polymorph.urls import NOSQL_SCHEMES, SQL_SCHEMES, url_scheme
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _OVERRIDE_KEY = re.compile(r"^[^.\s]+\.[^.\s]+$")
@@ -42,16 +42,9 @@ class TypeOverride(StrEnum):
     STRING = "string"
 
 
-def url_scheme(url: str) -> str:
-    """Return the database engine part of a URL.
-
-    'postgresql+psycopg://...' -> 'postgresql'
-    'mongodb+srv://...'        -> 'mongodb+srv'
-    """
-    scheme = url.split("://", 1)[0].lower()
-    if scheme in NOSQL_SCHEMES:
-        return scheme
-    return scheme.split("+", 1)[0]
+class RowErrorPolicy(StrEnum):
+    FAIL = "fail"
+    SKIP = "skip"
 
 
 def resolve_timezone(name: str) -> tzinfo:
@@ -84,6 +77,7 @@ class Settings(BaseModel):
 
     batch_size: int = Field(default=1000, ge=1, le=100_000)
     naive_timestamp_timezone: str = "UTC"
+    on_row_error: RowErrorPolicy = RowErrorPolicy.FAIL
 
     @field_validator("naive_timestamp_timezone")
     @classmethod
@@ -107,6 +101,7 @@ class Manifest(BaseModel):
     settings: Settings = Field(default_factory=Settings)
     tables: list[str] | None = None
     type_overrides: dict[str, TypeOverride] = Field(default_factory=dict)
+    transforms: dict[str, list[Rule]] = Field(default_factory=dict)
 
     @field_validator("tables")
     @classmethod
@@ -154,15 +149,16 @@ class Manifest(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _overrides_must_target_listed_tables(self) -> Self:
-        if self.tables is not None:
-            for key in self.type_overrides:
-                table = key.split(".", 1)[0]
-                if table not in self.tables:
-                    raise ValueError(
-                        f"type_overrides refers to table '{table}', "
-                        "which is not listed in tables"
-                    )
+    def _references_must_target_listed_tables(self) -> Self:
+        if self.tables is None:
+            return self
+        references = [("type_overrides", key.split(".", 1)[0]) for key in self.type_overrides]
+        references += [("transforms", table) for table in self.transforms]
+        for section, table in references:
+            if table not in self.tables:
+                raise ValueError(
+                    f"{section} refers to table '{table}', which is not listed in tables"
+                )
         return self
 
 
