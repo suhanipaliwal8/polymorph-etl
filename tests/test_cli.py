@@ -15,6 +15,15 @@ EXAMPLE = (
     / "pipelines"
     / "postgres-to-mongo.yaml"
 )
+MASKED = EXAMPLE.with_name("postgres-to-mongo-masked.yaml")
+
+
+def preview_env(shop_url):
+    return {
+        "SOURCE_URL": shop_url,
+        "TARGET_URL": "mongodb://localhost:27018/shop",
+        "HASH_SALT": "unit-test-salt",
+    }
 
 
 def test_version_flag():
@@ -173,3 +182,40 @@ def test_run_rejects_sql_to_sql_until_it_is_implemented(monkeypatch):
     assert result.exit_code == 1
     assert "not available yet" in result.output
     assert "secret" not in result.output
+
+def test_validate_counts_transform_rules(monkeypatch):
+    for name, value in preview_env("postgresql+psycopg://user:secret@localhost:5433/shop").items():
+        monkeypatch.setenv(name, value)
+
+    result = runner.invoke(app, ["validate", str(MASKED)])
+
+    assert result.exit_code == 0
+    assert "rules:  10" in result.output
+
+
+def test_preview_with_a_manifest_shows_the_documents_mongodb_would_receive(shop_url):
+    result = runner.invoke(
+        app,
+        ["preview", "orders", "--manifest", str(MASKED), "--limit", "2"],
+        env=preview_env(shop_url),
+    )
+
+    assert result.exit_code == 0
+    docs = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    assert len(docs) == 2
+    assert all("$numberDecimal" in doc["total_with_tax"] for doc in docs)
+    assert all("id" not in doc for doc in docs)
+
+
+def test_preview_with_a_manifest_skips_rejected_rows_and_says_why(shop_url):
+    result = runner.invoke(
+        app,
+        ["preview", "customers", "--manifest", str(MASKED), "--limit", "100"],
+        env=preview_env(shop_url),
+    )
+
+    assert result.exit_code == 0
+    docs = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    assert len(docs) == 47
+    assert "***" in docs[0]["email"]
+    assert "customer email is required" in result.output

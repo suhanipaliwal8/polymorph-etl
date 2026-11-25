@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+from bson import json_util
 
 from polymorph import __version__
 from polymorph.draft import render_manifest_draft
@@ -22,8 +23,14 @@ from polymorph.pipeline import (
     PipelineError,
     format_footer,
     format_table_row,
+    plan_table,
+    process_row,
     run_pipeline,
 )
+
+PREVIEW_SCAN_LIMIT = 10_000
+EXIT_ROWS_REJECTED = 3
+
 app = typer.Typer(
     name="polymorph",
     help="Schema-aware ETL and migration engine.",
@@ -78,6 +85,8 @@ def validate(
     typer.echo(f"  batch:  {manifest.settings.batch_size} rows")
     tables = "all" if manifest.tables is None else str(len(manifest.tables))
     typer.echo(f"  tables: {tables}")
+    rules = sum(len(table_rules) for table_rules in manifest.transforms.values())
+    typer.echo(f"  rules:  {rules}")
 
 
 @app.command("inspect")
@@ -147,19 +156,28 @@ def inspect_command(
     typer.echo(f"Next: review it, then run: polymorph validate {generate_manifest}")
 
 
-
 @app.command()
 def preview(
     table_name: Annotated[str, typer.Argument(metavar="TABLE", help="Table to read.")],
     source_url: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--source-url",
             envvar="SOURCE_URL",
             show_default=False,
             help="Source database URL (or set the SOURCE_URL environment variable).",
         ),
-    ],
+    ] = None,
+    manifest_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--manifest",
+            help=(
+                "Apply this pipeline's type translation and transform rules and "
+                "print the documents MongoDB would receive."
+            ),
+        ),
+    ] = None,
     limit: Annotated[
         int, typer.Option("--limit", min=1, help="Maximum number of rows to print.")
     ] = 5,
@@ -173,33 +191,77 @@ def preview(
 ) -> None:
     """Print the first rows of a table as JSON lines, read with keyset pagination.
 
-    Rows go to stdout; per-batch progress goes to stderr, so output stays pipeable.
+    Rows go to stdout; progress and notes go to stderr, so output stays pipeable.
     """
+    manifest = None
+    if manifest_path is not None:
+        try:
+            manifest = load_manifest(manifest_path)
+        except ManifestError as exc:
+            raise _fail(str(exc)) from exc
+        source_url = manifest.source.url
+
+    if source_url is None:
+        raise typer.BadParameter(
+            "provide --source-url (or set SOURCE_URL), or use --manifest",
+            param_hint="--source-url",
+        )
+
     try:
         engine = create_source_engine(source_url)
     except InspectError as exc:
         raise _fail(str(exc)) from exc
 
-    printed = 0
+    shown = scanned = rejected = filtered = 0
     try:
-        batches = extract_batches(
-            engine, table_name, batch_size=min(batch_size, limit), schema=schema
-        )
+        plan = None
+        if manifest is not None:
+            plan = plan_table(engine, table_name, manifest)
+            for note in (*plan.translator.notes, *plan.transform.notes):
+                typer.echo(f"-- note: {note}", err=True)
+
+        fetch_size = batch_size if plan is not None else min(batch_size, limit)
+        stop = False
+        batches = extract_batches(engine, table_name, batch_size=fetch_size, schema=schema)
         for number, batch in enumerate(batches, start=1):
             typer.echo(
                 f"-- batch {number}: {len(batch.rows)} rows fetched, cursor={batch.cursor}",
                 err=True,
             )
             for row in batch.rows:
-                typer.echo(json.dumps(row, default=str, ensure_ascii=False))
-                printed += 1
-                if printed >= limit:
-                    return
-    except ExtractError as exc:
+                scanned += 1
+                if plan is None:
+                    typer.echo(json.dumps(row, default=str, ensure_ascii=False))
+                else:
+                    outcome = process_row(plan, row)
+                    if outcome.rejection is not None:
+                        rejected += 1
+                        typer.echo(f"-- row rejected: {outcome.rejection}", err=True)
+                        continue
+                    if outcome.document is None:
+                        filtered += 1
+                        continue
+                    typer.echo(json_util.dumps(outcome.document, ensure_ascii=False))
+                shown += 1
+                if shown >= limit:
+                    stop = True
+                    break
+            if stop:
+                break
+            if scanned >= PREVIEW_SCAN_LIMIT:
+                typer.echo(f"-- stopped after scanning {scanned:,} rows", err=True)
+                break
+
+        if plan is not None:
+            typer.echo(
+                f"-- {shown} shown, {filtered} filtered, {rejected} rejected "
+                f"({scanned} rows scanned)",
+                err=True,
+            )
+    except (PipelineError, ExtractError, InspectError) as exc:
         raise _fail(str(exc)) from exc
     finally:
         engine.dispose()
-
 
 
 @app.command()
@@ -224,7 +286,7 @@ def run(
     def show_plan(notes) -> None:
         if notes:
             typer.echo("")
-            typer.echo("Type mapping notes:")
+            typer.echo("Notes:")
             for note in notes:
                 typer.echo(f"  - {note}")
 
@@ -235,6 +297,11 @@ def run(
             typer.echo(TABLE_HEADER)
             header_printed = True
         typer.echo(format_table_row(result))
+        if result.rejected:
+            shown = len(result.rejection_samples)
+            typer.echo(f"  ! {result.rejected:,} row(s) rejected; first {shown} reason(s):")
+            for sample in result.rejection_samples:
+                typer.echo(f"      - {sample}")
 
     try:
         summary = run_pipeline(manifest, on_plan=show_plan, on_table_done=show_table)
@@ -248,4 +315,15 @@ def run(
         raise _fail(str(exc)) from exc
 
     typer.echo("")
-    typer.secho(format_footer(summary), fg=typer.colors.GREEN)
+    color = typer.colors.YELLOW if summary.rejected else typer.colors.GREEN
+    typer.secho(format_footer(summary), fg=color)
+
+    if summary.rejected:
+        typer.secho(
+            f"{summary.rejected:,} row(s) were rejected and skipped "
+            "(settings.on_row_error: skip). Only the first reasons per table are listed "
+            "above; the dead-letter queue (Phase 10) will record every one.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_ROWS_REJECTED)
