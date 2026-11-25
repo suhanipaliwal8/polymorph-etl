@@ -1,6 +1,10 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+import uuid
 
+from sqlalchemy import create_engine, text
+
+from polymorph.pipeline import PipelineError
 import pytest
 from bson import Decimal128
 from typer.testing import CliRunner
@@ -111,3 +115,50 @@ def test_cli_run_prints_a_summary(shop_url, mongo_target):
     assert result.exit_code == 0
     assert "customers" in result.output
     assert "Done: 4 table(s)" in result.output
+
+def test_type_overrides_normalise_uuid_columns(shop_url, mongo_target, make_manifest):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url, target_url, type_overrides={"customers.external_id": "uuid"}
+    )
+
+    run_pipeline(manifest)
+
+    value = db.customers.find_one({"_id": 1})["external_id"]
+    assert str(uuid.UUID(value)) == value  # canonical hyphenated form
+
+
+def test_naive_timestamps_use_the_configured_time_zone(shop_url, mongo_target, make_manifest):
+    target_url, db = mongo_target
+    run_pipeline(make_manifest(shop_url, target_url, tables=["customers"]))
+    as_utc = db.customers.find_one({"_id": 1})["created_at"]
+
+    run_pipeline(
+        make_manifest(
+            shop_url,
+            target_url,
+            tables=["customers"],
+            settings={"naive_timestamp_timezone": "Asia/Kolkata"},
+        )
+    )
+    as_ist = db.customers.find_one({"_id": 1})["created_at"]
+
+    # The same wall-clock time, read in UTC+05:30, is 5h30m earlier in UTC.
+    assert as_utc - as_ist == timedelta(hours=5, minutes=30)
+
+
+def test_translation_errors_name_the_table_column_and_row(
+    tmp_path, mongo_target, make_manifest
+):
+    target_url, db = mongo_target
+    path = tmp_path / "typeless.db"
+    engine = create_engine(f"sqlite:///{path.as_posix()}")
+    with engine.begin() as conn:  # SQLite does not enforce column types
+        conn.execute(text("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)"))
+        conn.execute(text("INSERT INTO items VALUES (1, 5), (2, 'abc')"))
+    engine.dispose()
+
+    with pytest.raises(PipelineError, match=r"items\.qty.*id=2"):
+        run_pipeline(make_manifest(f"sqlite:///{path.as_posix()}", target_url))
+
+    assert db.list_collection_names() == []  # the failing batch was never written

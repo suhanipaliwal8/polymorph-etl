@@ -28,6 +28,8 @@ def make_manifest():
         target_url="mongodb://localhost:27018/unused",
         tables=None,
         mode="sql-to-nosql",
+        type_overrides=None,
+        settings=None,
     ) -> Manifest:
         data = {
             "version": 1,
@@ -35,10 +37,12 @@ def make_manifest():
             "mode": mode,
             "source": {"url": source_url},
             "target": {"url": target_url},
-            "settings": {"batch_size": 7},
+            "settings": {"batch_size": 7, **(settings or {})},
         }
         if tables is not None:
             data["tables"] = tables
+        if type_overrides is not None:
+            data["type_overrides"] = type_overrides
         return Manifest.model_validate(data)
 
     return build
@@ -46,7 +50,7 @@ def make_manifest():
 
 @pytest.fixture()
 def mongo_target():
-    """A throwaway MongoDB database: yields (url, database). Skips if MongoDB is down."""
+    """A throwaway MongoDB database: yields (url, database)."""
     client = MongoClient(MONGO_BASE_URL, serverSelectionTimeoutMS=1500)
     try:
         client.admin.command("ping")

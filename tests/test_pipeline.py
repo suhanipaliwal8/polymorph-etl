@@ -49,3 +49,16 @@ def test_table_row_formatting():
     assert "customers" in row
     assert "1,234" in row
     assert row.endswith("1.50s")
+
+def test_override_for_an_unknown_column_fails_before_anything_is_written(
+    shop_url, make_manifest
+):
+    manifest = make_manifest(shop_url, type_overrides={"customers.nope": "uuid"})
+    with pytest.raises(PipelineError, match="unknown column"):
+        run_pipeline(manifest)
+
+
+def test_override_for_a_table_that_is_not_migrated_is_rejected(shop_url, make_manifest):
+    manifest = make_manifest(shop_url, type_overrides={"ghost.id": "uuid"})
+    with pytest.raises(PipelineError, match="not being migrated"):
+        run_pipeline(manifest)
