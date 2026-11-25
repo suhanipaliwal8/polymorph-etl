@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import datetime as dt
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 
-from bson import Decimal128
 from bson.errors import InvalidDocument
 from pymongo import MongoClient, ReplaceOne
 from pymongo.collection import Collection
@@ -82,32 +78,11 @@ def connect(url: str) -> tuple[MongoClient, Database]:
     return client, database
 
 
-def to_bson_value(value: Any) -> Any:
-    """Minimal bridge that makes a Python value storable as BSON.
-
-    Phase 6 replaces this with a schema-driven type translator.
-    """
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    if isinstance(value, Decimal):
-        return Decimal128(value)  # exact, unlike float
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if isinstance(value, dt.datetime):  # must be checked before dt.date
-        return value
-    if isinstance(value, dt.date):
-        return dt.datetime(value.year, value.month, value.day)
-    if isinstance(value, dt.time):
-        return value.isoformat()
-    if isinstance(value, Mapping):
-        return {str(key): to_bson_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [to_bson_value(item) for item in value]
-    return value
-
-
 def build_document(row: Mapping[str, Any], pk_names: Sequence[str]) -> dict[str, Any]:
-    """Turn a source row into a MongoDB document; the primary key becomes `_id`."""
+    """Turn an already-translated row into a MongoDB document.
+
+    The primary key becomes `_id`; the key columns are not repeated as fields.
+    """
     if "_id" in row and "_id" not in pk_names:
         raise LoadError(
             "A source column named '_id' collides with MongoDB's own _id field; "
@@ -115,16 +90,16 @@ def build_document(row: Mapping[str, Any], pk_names: Sequence[str]) -> dict[str,
         )
 
     if len(pk_names) == 1:
-        doc_id = to_bson_value(row[pk_names[0]])
+        doc_id = row[pk_names[0]]
     else:
         # Field order inside a subdocument _id matters in MongoDB:
         # always follow the primary-key order, never the row's column order.
-        doc_id = {name: to_bson_value(row[name]) for name in pk_names}
+        doc_id = {name: row[name] for name in pk_names}
 
     document: dict[str, Any] = {"_id": doc_id}
     for name, value in row.items():
         if name not in pk_names:
-            document[name] = to_bson_value(value)
+            document[name] = value
     return document
 
 

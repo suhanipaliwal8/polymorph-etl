@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Mapping, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import (
@@ -22,6 +24,7 @@ SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "sqlite", "mssql", "oracle"}
 NOSQL_SCHEMES = {"mongodb", "mongodb+srv"}
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_OVERRIDE_KEY = re.compile(r"^[^.\s]+\.[^.\s]+$")
 
 
 class ManifestError(Exception):
@@ -31,6 +34,12 @@ class ManifestError(Exception):
 class Mode(StrEnum):
     SQL_TO_SQL = "sql-to-sql"
     SQL_TO_NOSQL = "sql-to-nosql"
+
+
+class TypeOverride(StrEnum):
+    UUID = "uuid"
+    BOOLEAN = "boolean"
+    STRING = "string"
 
 
 def url_scheme(url: str) -> str:
@@ -43,6 +52,18 @@ def url_scheme(url: str) -> str:
     if scheme in NOSQL_SCHEMES:
         return scheme
     return scheme.split("+", 1)[0]
+
+
+def resolve_timezone(name: str) -> tzinfo:
+    """Turn 'UTC' or an IANA name such as 'Asia/Kolkata' into a tzinfo."""
+    if name.upper() == "UTC":
+        return timezone.utc  # no time zone database needed for the default
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+        raise ValueError(
+            f"unknown time zone '{name}' (use an IANA name such as 'Asia/Kolkata', or 'UTC')"
+        ) from exc
 
 
 class Endpoint(BaseModel):
@@ -62,6 +83,17 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     batch_size: int = Field(default=1000, ge=1, le=100_000)
+    naive_timestamp_timezone: str = "UTC"
+
+    @field_validator("naive_timestamp_timezone")
+    @classmethod
+    def _timezone_must_exist(cls, value: str) -> str:
+        resolve_timezone(value)
+        return value
+
+    @property
+    def naive_tz(self) -> tzinfo:
+        return resolve_timezone(self.naive_timestamp_timezone)
 
 
 class Manifest(BaseModel):
@@ -73,6 +105,34 @@ class Manifest(BaseModel):
     source: Endpoint
     target: Endpoint
     settings: Settings = Field(default_factory=Settings)
+    tables: list[str] | None = None
+    type_overrides: dict[str, TypeOverride] = Field(default_factory=dict)
+
+    @field_validator("tables")
+    @classmethod
+    def _tables_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if not value:
+            raise ValueError(
+                "must list at least one table (omit the key to migrate all tables)"
+            )
+        if any(not name.strip() for name in value):
+            raise ValueError("table names must not be empty")
+        duplicates = sorted({name for name in value if value.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate table names: {', '.join(duplicates)}")
+        return value
+
+    @field_validator("type_overrides")
+    @classmethod
+    def _override_keys_must_be_table_dot_column(
+        cls, value: dict[str, TypeOverride]
+    ) -> dict[str, TypeOverride]:
+        for key in value:
+            if not _OVERRIDE_KEY.match(key):
+                raise ValueError(f"'{key}' must look like table.column")
+        return value
 
     @model_validator(mode="after")
     def _schemes_must_match_mode(self) -> Self:
@@ -91,6 +151,18 @@ class Manifest(BaseModel):
                 f"target scheme '{target}' is not valid for mode '{self.mode.value}' "
                 f"(expected: {', '.join(sorted(allowed))})"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _overrides_must_target_listed_tables(self) -> Self:
+        if self.tables is not None:
+            for key in self.type_overrides:
+                table = key.split(".", 1)[0]
+                if table not in self.tables:
+                    raise ValueError(
+                        f"type_overrides refers to table '{table}', "
+                        "which is not listed in tables"
+                    )
         return self
 
 
@@ -150,49 +222,3 @@ def load_manifest(path: Path, env: Mapping[str, str] | None = None) -> Manifest:
         return Manifest.model_validate(resolved)
     except ValidationError as exc:
         raise ManifestError(_format_errors(exc)) from exc
-
-class Manifest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    version: Literal[1]
-    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    mode: Mode
-    source: Endpoint
-    target: Endpoint
-    settings: Settings = Field(default_factory=Settings)
-    tables: list[str] | None = None
-
-    @field_validator("tables")
-    @classmethod
-    def _tables_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return value
-        if not value:
-            raise ValueError(
-                "must list at least one table (omit the key to migrate all tables)"
-            )
-        if any(not name.strip() for name in value):
-            raise ValueError("table names must not be empty")
-        duplicates = sorted({name for name in value if value.count(name) > 1})
-        if duplicates:
-            raise ValueError(f"duplicate table names: {', '.join(duplicates)}")
-        return value
-
-    @model_validator(mode="after")
-    def _schemes_must_match_mode(self) -> Self:
-        source = url_scheme(self.source.url)
-        target = url_scheme(self.target.url)
-
-        if source not in SQL_SCHEMES:
-            raise ValueError(
-                f"source scheme '{source}' is not a supported SQL database "
-                f"(supported: {', '.join(sorted(SQL_SCHEMES))})"
-            )
-
-        allowed = SQL_SCHEMES if self.mode is Mode.SQL_TO_SQL else NOSQL_SCHEMES
-        if target not in allowed:
-            raise ValueError(
-                f"target scheme '{target}' is not valid for mode '{self.mode.value}' "
-                f"(expected: {', '.join(sorted(allowed))})"
-            )
-        return self

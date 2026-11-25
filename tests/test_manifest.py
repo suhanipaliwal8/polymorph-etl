@@ -1,8 +1,9 @@
+from datetime import timezone
 from pathlib import Path
 
 import pytest
 
-from polymorph.manifest import ManifestError, Mode, load_manifest, url_scheme
+from polymorph.manifest import ManifestError, Mode, TypeOverride, load_manifest, url_scheme
 
 POSTGRES = "postgresql+psycopg://user:secret@localhost:5433/shop"
 MYSQL = "mysql+pymysql://user:secret@localhost:3307/shop"
@@ -106,7 +107,11 @@ def test_top_level_must_be_a_mapping(tmp_path):
 
 @pytest.mark.parametrize(
     ("filename", "target_url"),
-    [("postgres-to-mongo.yaml", MONGO), ("postgres-to-mysql.yaml", MYSQL)],
+    [
+        ("postgres-to-mongo.yaml", MONGO),
+        ("postgres-to-mysql.yaml", MYSQL),
+        ("mysql-to-mongo.yaml", MONGO),
+    ],
 )
 def test_example_pipelines_are_valid(filename, target_url):
     env = {"SOURCE_URL": POSTGRES, "TARGET_URL": target_url}
@@ -133,4 +138,49 @@ def test_empty_tables_list_is_rejected(tmp_path):
 def test_duplicate_tables_are_rejected(tmp_path):
     content = VALID + "tables:\n  - orders\n  - orders\n"
     with pytest.raises(ManifestError, match="duplicate"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+def test_naive_timestamp_timezone_defaults_to_utc(tmp_path):
+    manifest = load_manifest(write_manifest(tmp_path), env=ENV)
+    assert manifest.settings.naive_timestamp_timezone == "UTC"
+    assert manifest.settings.naive_tz is timezone.utc
+
+
+def test_named_time_zone_is_accepted(tmp_path):
+    content = VALID + "settings:\n  naive_timestamp_timezone: Asia/Kolkata\n"
+    manifest = load_manifest(write_manifest(tmp_path, content), env=ENV)
+    assert str(manifest.settings.naive_tz) == "Asia/Kolkata"
+
+
+def test_unknown_time_zone_is_rejected(tmp_path):
+    content = VALID + "settings:\n  naive_timestamp_timezone: Mars/Olympus\n"
+    with pytest.raises(ManifestError, match="unknown time zone"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_type_overrides_are_loaded(tmp_path):
+    content = VALID + "type_overrides:\n  customers.external_id: uuid\n"
+    manifest = load_manifest(write_manifest(tmp_path, content), env=ENV)
+    assert manifest.type_overrides == {"customers.external_id": TypeOverride.UUID}
+
+
+def test_type_override_key_must_be_table_dot_column(tmp_path):
+    content = VALID + "type_overrides:\n  external_id: uuid\n"
+    with pytest.raises(ManifestError, match="table.column"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_type_override_value_must_be_known(tmp_path):
+    content = VALID + "type_overrides:\n  customers.external_id: json\n"
+    with pytest.raises(ManifestError, match="type_overrides"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_type_override_must_target_a_listed_table(tmp_path):
+    content = (
+        VALID
+        + "tables:\n  - orders\n"
+        + "type_overrides:\n  customers.external_id: uuid\n"
+    )
+    with pytest.raises(ManifestError, match="not listed"):
         load_manifest(write_manifest(tmp_path, content), env=ENV)

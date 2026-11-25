@@ -14,7 +14,6 @@ from polymorph.mongo_loader import (
     LoadStats,
     build_document,
     connect,
-    to_bson_value,
     write_documents,
 )
 
@@ -40,44 +39,6 @@ def result(created=0, modified=0, matched=0):
     return SimpleNamespace(
         upserted_count=created, modified_count=modified, matched_count=matched
     )
-
-
-# --- type bridge -------------------------------------------------------------
-
-
-def test_decimal_becomes_exact_decimal128():
-    value = Decimal("12345678901234.5678")
-
-    converted = to_bson_value(value)
-
-    assert isinstance(converted, Decimal128)
-    assert converted.to_decimal() == value
-    # A float cannot hold this value exactly: this is why Decimal128 matters.
-    assert Decimal(str(float(value))) != value
-
-
-def test_uuid_becomes_a_string():
-    value = uuid.UUID("12345678-1234-5678-1234-567812345678")
-    assert to_bson_value(value) == "12345678-1234-5678-1234-567812345678"
-
-
-def test_dates_and_times():
-    aware = dt.datetime(2024, 5, 1, 10, 30, tzinfo=dt.timezone.utc)
-    assert to_bson_value(aware) is aware
-    assert to_bson_value(dt.date(2024, 5, 1)) == dt.datetime(2024, 5, 1)
-    assert to_bson_value(dt.time(9, 15)) == "09:15:00"
-
-
-@pytest.mark.parametrize("value", [None, True, 7, 1.5, "text", b"bytes"])
-def test_plain_values_pass_through_unchanged(value):
-    assert to_bson_value(value) == value
-
-
-def test_nested_structures_are_converted_recursively():
-    value = {"a": [Decimal("1.5"), {"b": uuid.UUID(int=1)}]}
-    converted = to_bson_value(value)
-    assert isinstance(converted["a"][0], Decimal128)
-    assert converted["a"][1]["b"] == "00000000-0000-0000-0000-000000000001"
 
 
 # --- documents ---------------------------------------------------------------

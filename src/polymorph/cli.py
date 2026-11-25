@@ -221,6 +221,13 @@ def run(
 
     header_printed = False
 
+    def show_plan(notes) -> None:
+        if notes:
+            typer.echo("")
+            typer.echo("Type mapping notes:")
+            for note in notes:
+                typer.echo(f"  - {note}")
+
     def show_table(result) -> None:
         nonlocal header_printed
         if not header_printed:
@@ -230,7 +237,7 @@ def run(
         typer.echo(format_table_row(result))
 
     try:
-        summary = run_pipeline(manifest, on_table_done=show_table)
+        summary = run_pipeline(manifest, on_plan=show_plan, on_table_done=show_table)
     except (PipelineError, InspectError, ExtractError, LoadError) as exc:
         if header_printed:
             typer.echo(

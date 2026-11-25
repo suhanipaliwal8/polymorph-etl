@@ -28,7 +28,7 @@ crash-safe precision.
 - [x] Phase 3: Schema discovery (`inspect`) and draft manifests
 - [x] Phase 4: Keyset streaming extractor
 - [x] Phase 5: MongoDB bulk loader and first end-to-end run
-- [ ] Phase 6: Type and precision translator
+- [x] Phase 6: Type and precision translator
 - [ ] Phase 7: Transform engine
 - [ ] Phase 8: Join folding
 - [ ] Phase 9: Checkpointing and resume
@@ -152,6 +152,23 @@ and a minimal type bridge. See [`docs/loading.md`](docs/loading.md).
 
 Tests that need MongoDB are marked `integration` and are skipped when it is
 not running: `pytest -m "not integration"` runs only the fast ones.
+
+Current limits: only `sql-to-nosql`, flat collections and no transformations.
+
+### Type translation
+
+Column types are mapped by the **reflected SQL type**, not guessed:
+`DECIMAL` becomes `Decimal128` (exact, never a float), timestamps become UTC
+dates, UUIDs become canonical strings, `TINYINT(1)` becomes a boolean, and
+values that do not fit their column type stop the run with the table, column
+and primary key of the row.
+
+Timestamps without a time zone (for example MySQL `DATETIME`) are read in
+`settings.naive_timestamp_timezone` (default `UTC`), and a hint such as
+`type_overrides: {customers.external_id: uuid}` teaches the tool what a type
+alone cannot say. The same data migrated from PostgreSQL and from MySQL
+produces identical MongoDB documents. See
+[`docs/type-translation.md`](docs/type-translation.md).
 
 ## Continuous integration
 
