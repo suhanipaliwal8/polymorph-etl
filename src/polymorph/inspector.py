@@ -12,7 +12,7 @@ from sqlalchemy.exc import ArgumentError, DBAPIError, NoSuchModuleError
 from sqlalchemy.engine.reflection import Inspector
 
 
-from polymorph.manifest import NOSQL_SCHEMES, url_scheme
+from polymorph.urls import NOSQL_SCHEMES, url_scheme
 
 DRIVER_HINTS = {
     "postgresql": 'pip install "polymorph-etl[postgres]" and use a URL like postgresql+psycopg://...',
