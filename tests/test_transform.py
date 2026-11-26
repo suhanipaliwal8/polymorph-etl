@@ -382,3 +382,9 @@ def test_plan_applies_rules_in_order_and_signals_dropped_rows():
 def test_plan_notes_carry_the_table_name():
     result = plan([HashRule(type="hash", field="email", into="h")])
     assert result.notes[0].startswith("t: ")
+
+def test_the_id_collision_check_only_applies_to_root_tables():
+    # Embedded rows may legitimately contain a field named _id.
+    build_transform_plan("t", ["pk", "_id"], [], [], root=False)
+    with pytest.raises(TransformConfigError, match="_id"):
+        build_transform_plan("t", ["pk", "_id"], ["pk"], [])

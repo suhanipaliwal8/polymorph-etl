@@ -431,6 +431,7 @@ def build_transform_plan(
     columns: Sequence[str],
     primary_key: Sequence[str],
     rules: Sequence[_Rule],
+    root: bool = True,
 ) -> TransformPlan:
     """Validate a table's rules against its columns, before anything runs."""
     fields = frozenset(columns)
@@ -446,7 +447,7 @@ def build_transform_plan(
             ) from exc
         notes.extend(f"{table}: {note}" for note in rule_notes)
 
-    if "_id" in fields and "_id" not in protected:
+    if root and "_id" in fields and "_id" not in protected:
         raise TransformConfigError(
             f"table '{table}' has a field named '_id' that is not its primary key; "
             "rename it with a 'rename' rule (it would collide with MongoDB's _id)"
