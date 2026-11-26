@@ -22,3 +22,7 @@ dlq_errors.jsonl
 # Local pipeline drafts and run output
 /pipeline.yaml
 /runs/
+
+
+# Checkpoint state
+/.polymorph/
