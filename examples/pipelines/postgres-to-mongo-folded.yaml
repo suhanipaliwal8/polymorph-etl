@@ -1,0 +1,53 @@
+# Folded pipeline: ONE MongoDB document per customer, with the customer's
+# profile (1:1), orders (1:N) and each order's items (1:N) embedded.
+# See docs/folding.md.
+version: 1
+name: shop-folded
+mode: sql-to-nosql
+
+source:
+  url: ${SOURCE_URL}
+
+target:
+  url: ${TARGET_URL}
+
+settings:
+  batch_size: 500
+  on_row_error: skip
+
+collections:
+  customers:
+    from: customers
+    embed:
+      - table: customer_profiles
+        as: profile
+        relation: one
+      - table: orders
+        as: orders
+        relation: many
+        embed:
+          - table: order_items
+            as: items
+            relation: many
+
+type_overrides:
+  customers.external_id: uuid
+
+transforms:
+  # A table's rules run after its own children are embedded,
+  # so they can use embedded fields such as len(items).
+  order_items:
+    - type: require
+      expression: quantity > 0
+      message: quantity must be positive
+  orders:
+    - type: compute
+      into: item_count
+      expression: len(items)
+  customers:
+    - type: compute
+      into: order_count
+      expression: len(orders)
+    - type: compute
+      into: has_profile
+      expression: profile is not None
