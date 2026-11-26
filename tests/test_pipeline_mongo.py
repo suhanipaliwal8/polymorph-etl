@@ -121,7 +121,7 @@ def test_cli_run_prints_a_summary(shop_url, mongo_target):
 
     assert result.exit_code == 0
     assert "customers" in result.output
-    assert "Done: 4 table(s)" in result.output
+    assert "Done: 4 collection(s)" in result.output
 
 def test_type_overrides_normalise_uuid_columns(shop_url, mongo_target, make_manifest):
     target_url, db = mongo_target
