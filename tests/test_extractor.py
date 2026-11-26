@@ -1,7 +1,8 @@
 import pytest
 from sqlalchemy import text
+from sqlalchemy import event
 
-from polymorph.extractor import ExtractError, extract_batches
+from polymorph.extractor import ExtractError, extract_batches, fetch_related, reflect_table
 from polymorph.inspector import create_source_engine
 
 
@@ -129,3 +130,84 @@ def test_rows_are_plain_dicts_with_every_column(shop_engine):
     row = next(iter(extract_batches(shop_engine, "customers", batch_size=1))).rows[0]
     assert isinstance(row, dict)
     assert set(row) == {"id", "external_id", "name", "email", "created_at", "is_active"}
+
+def ids(rows):
+    return [row["id"] for row in rows]
+
+
+def test_fetch_related_returns_the_rows_of_the_given_keys_in_primary_key_order(shop_engine):
+    table = reflect_table(shop_engine, "orders")
+    with shop_engine.connect() as conn:
+        expected = [
+            row[0]
+            for row in conn.execute(
+                text("SELECT id FROM orders WHERE customer_id IN (1, 3) ORDER BY id")
+            )
+        ]
+
+    rows = fetch_related(shop_engine, table, ["customer_id"], [(3,), (1,)])
+
+    assert ids(rows) == expected
+    assert {row["customer_id"] for row in rows} <= {1, 3}
+
+
+def test_fetch_related_uses_one_query_per_chunk_of_keys(shop_engine):
+    table = reflect_table(shop_engine, "orders")
+    statements = []
+    event.listen(
+        shop_engine,
+        "before_cursor_execute",
+        lambda conn, cursor, statement, *args: statements.append(statement),
+    )
+
+    rows = fetch_related(
+        shop_engine, table, ["customer_id"], [(1,), (2,), (3,), (4,), (5,)], chunk_size=2
+    )
+
+    assert len(statements) == 3  # 5 keys in chunks of 2
+    with shop_engine.connect() as conn:
+        expected = conn.execute(
+            text("SELECT COUNT(*) FROM orders WHERE customer_id IN (1, 2, 3, 4, 5)")
+        ).scalar_one()
+    assert len(rows) == expected
+
+
+def test_fetch_related_with_no_keys_does_not_query(shop_engine):
+    table = reflect_table(shop_engine, "orders")
+    statements = []
+    event.listen(
+        shop_engine,
+        "before_cursor_execute",
+        lambda conn, cursor, statement, *args: statements.append(statement),
+    )
+
+    assert fetch_related(shop_engine, table, ["customer_id"], []) == []
+    assert statements == []
+
+
+def test_fetch_related_supports_composite_keys(blank_engine):
+    execute(
+        blank_engine,
+        "CREATE TABLE lesson (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO lesson VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 2)",
+    )
+    table = reflect_table(blank_engine, "lesson")
+
+    rows = fetch_related(blank_engine, table, ["a", "b"], [(1, 2), (2, 1)], chunk_size=2)
+
+    assert ids(rows) == [2, 3]
+
+
+def test_fetch_related_needs_a_primary_key(blank_engine):
+    execute(blank_engine, "CREATE TABLE audit_log (owner INTEGER, message TEXT)")
+    table = reflect_table(blank_engine, "audit_log")
+    with pytest.raises(ExtractError, match="no primary key"):
+        fetch_related(blank_engine, table, ["owner"], [(1,)])
+
+
+def test_fetch_related_rejects_unknown_columns_and_bad_chunk_sizes(shop_engine):
+    table = reflect_table(shop_engine, "orders")
+    with pytest.raises(ExtractError, match="no column"):
+        fetch_related(shop_engine, table, ["nope"], [(1,)])
+    with pytest.raises(ValueError):
+        fetch_related(shop_engine, table, ["customer_id"], [(1,)], chunk_size=0)

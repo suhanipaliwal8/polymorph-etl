@@ -1,4 +1,5 @@
 from datetime import timezone
+import yaml
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from polymorph.manifest import (
     ManifestError,
     Mode,
+    Relation,
     RowErrorPolicy,
     TypeOverride,
     load_manifest,
@@ -118,6 +120,7 @@ def test_top_level_must_be_a_mapping(tmp_path):
         ("postgres-to-mongo.yaml", MONGO),
         ("postgres-to-mysql.yaml", MYSQL),
         ("mysql-to-mongo.yaml", MONGO),
+        ("postgres-to-mongo-folded.yaml", MONGO),
     ],
 )
 def test_example_pipelines_are_valid(filename, target_url):
@@ -189,5 +192,101 @@ def test_type_override_must_target_a_listed_table(tmp_path):
         + "tables:\n  - orders\n"
         + "type_overrides:\n  customers.external_id: uuid\n"
     )
+    with pytest.raises(ManifestError, match="not listed"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+FOLDED = """\
+collections:
+  customers:
+    from: customers
+    embed:
+      - table: orders
+        as: orders
+        relation: many
+        embed:
+          - table: order_items
+            as: items
+            relation: many
+"""
+
+
+def test_collections_are_loaded(tmp_path):
+    manifest = load_manifest(write_manifest(tmp_path, VALID + FOLDED), env=ENV)
+
+    spec = manifest.collections["customers"]
+    orders = spec.embed[0]
+    assert spec.from_ == "customers"
+    assert (orders.table, orders.as_, orders.relation) == ("orders", "orders", Relation.MANY)
+    assert orders.embed[0].as_ == "items"
+    assert orders.keep_foreign_key is False
+    assert manifest.used_tables() == {"customers", "orders", "order_items"}
+
+
+def test_all_tables_are_used_when_neither_tables_nor_collections_are_given(tmp_path):
+    assert load_manifest(write_manifest(tmp_path), env=ENV).used_tables() is None
+
+
+@pytest.mark.parametrize(
+    ("embed", "message"),
+    [
+        ("      - table: orders\n        as: o\n", "relation"),
+        ("      - table: orders\n        as: o\n        relation: some\n", "relation"),
+        ("      - table: orders\n        as: _id\n        relation: many\n", "reserved"),
+        ("      - table: orders\n        as: a.b\n        relation: many\n", "valid MongoDB field name"),
+        (
+            "      - table: orders\n        as: o\n        relation: many\n"
+            "      - table: order_items\n        as: o\n        relation: many\n",
+            "duplicate",
+        ),
+        ("      - table: orders\n        as: o\n        relation: many\n        join: {}\n", "at least one"),
+        ("      - table: orders\n        as: o\n        relation: many\n        foreign_key: x\n", "foreign_key"),
+    ],
+)
+def test_invalid_embeds_are_rejected(tmp_path, embed, message):
+    content = VALID + "collections:\n  customers:\n    from: customers\n    embed:\n" + embed
+    with pytest.raises(ManifestError, match=message):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_embedding_deeper_than_five_levels_is_rejected(tmp_path):
+    spec = {"table": "t6", "as": "l6", "relation": "many"}
+    for level in range(5, 0, -1):
+        spec = {"table": f"t{level}", "as": f"l{level}", "relation": "many", "embed": [spec]}
+    data = {
+        "version": 1,
+        "name": "deep",
+        "mode": "sql-to-nosql",
+        "source": {"url": POSTGRES},
+        "target": {"url": MONGO},
+        "collections": {"root": {"from": "r", "embed": [spec]}},
+    }
+    path = tmp_path / "deep.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="levels deep"):
+        load_manifest(path, env={})
+
+
+def test_collections_need_a_document_target(tmp_path):
+    content = VALID.replace("sql-to-nosql", "sql-to-sql") + FOLDED
+    with pytest.raises(ManifestError, match="need mode"):
+        load_manifest(write_manifest(tmp_path, content), env={**ENV, "TARGET_URL": MYSQL})
+
+
+def test_a_collection_name_cannot_also_be_a_flat_table(tmp_path):
+    content = VALID + FOLDED + "tables:\n  - customers\n"
+    with pytest.raises(ManifestError, match="also listed in tables"):
+        load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+
+def test_transforms_may_target_embedded_tables(tmp_path):
+    content = VALID + FOLDED + "transforms:\n  order_items:\n    - type: drop\n      fields: [sku]\n"
+    manifest = load_manifest(write_manifest(tmp_path, content), env=ENV)
+    assert "order_items" in manifest.transforms
+
+
+def test_transforms_must_target_tables_used_by_collections(tmp_path):
+    content = VALID + FOLDED + "transforms:\n  ghost:\n    - type: drop\n      fields: [x]\n"
     with pytest.raises(ManifestError, match="not listed"):
         load_manifest(write_manifest(tmp_path, content), env=ENV)

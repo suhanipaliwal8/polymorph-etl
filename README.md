@@ -30,7 +30,7 @@ crash-safe precision.
 - [x] Phase 5: MongoDB bulk loader and first end-to-end run
 - [x] Phase 6: Type and precision translator
 - [x] Phase 7: Transform engine
-- [ ] Phase 8: Join folding
+- [x] Phase 8: Join folding
 - [ ] Phase 9: Checkpointing and resume
 - [ ] Phase 10: Dead-letter queue
 - [ ] Phase 11: Concurrency
@@ -210,6 +210,46 @@ Rows a `filter` drops are **filtered**; invalid rows are **rejected**. With
 Expressions use a small, safe language (no `eval`). See
 [`docs/transforms.md`](docs/transforms.md) for every rule, the expression
 reference and the limits.
+
+### Fold related tables into documents
+
+Declare a collection and the tool reads the foreign keys from the database to
+build **one document per root row**, with related rows embedded:
+
+```yaml
+collections:
+  customers:
+    from: customers
+    embed:
+      - table: customer_profiles
+        as: profile
+        relation: one         # object, or null
+      - table: orders
+        as: orders
+        relation: many        # array (empty when there are none)
+        embed:
+          - table: order_items
+            as: items
+            relation: many
+```
+
+```bash
+polymorph preview customers --manifest examples/pipelines/postgres-to-mongo-folded.yaml
+polymorph run examples/pipelines/postgres-to-mongo-folded.yaml
+```
+
+```
+COLLECTION                     READ  FILTERED  REJECTED  CREATED  UPDATED  UNCHANGED     TIME
+customers                       200         0         1      199        0          0    0.40s
+  + customer_profiles           180         0         0
+  + orders                      410         0         0
+    + order_items             1,259         0         1
+```
+
+Children are fetched per batch with `WHERE fk IN (...)` (no N+1 queries) and
+ordered by primary key, so reruns are idempotent. Documents are
+all-or-nothing: a rejected embedded row rejects its document. Rules see
+embedded fields (`len(orders)`). See [`docs/folding.md`](docs/folding.md).
 
 ## Continuous integration
 

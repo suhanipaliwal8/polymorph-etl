@@ -31,6 +31,7 @@ def make_manifest():
         type_overrides=None,
         settings=None,
         transforms=None,
+        collections=None,
     ) -> Manifest:
         data = {
             "version": 1,
@@ -46,9 +47,30 @@ def make_manifest():
             data["type_overrides"] = type_overrides
         if transforms is not None:
             data["transforms"] = transforms
+        if collections is not None:
+            data["collections"] = collections
         return Manifest.model_validate(data)
 
     return build
+
+
+@pytest.fixture()
+def folding_spec():
+    """customers with profile (1:1), orders (1:N) and each order's items (1:N)."""
+    return {
+        "customers": {
+            "from": "customers",
+            "embed": [
+                {"table": "customer_profiles", "as": "profile", "relation": "one"},
+                {
+                    "table": "orders",
+                    "as": "orders",
+                    "relation": "many",
+                    "embed": [{"table": "order_items", "as": "items", "relation": "many"}],
+                },
+            ],
+        }
+    }
 
 
 @pytest.fixture()

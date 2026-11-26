@@ -26,6 +26,8 @@ from polymorph.urls import NOSQL_SCHEMES, SQL_SCHEMES, url_scheme
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _OVERRIDE_KEY = re.compile(r"^[^.\s]+\.[^.\s]+$")
 
+MAX_EMBED_DEPTH = 5
+
 
 class ManifestError(Exception):
     """A manifest could not be loaded or is invalid. The message is user-facing."""
@@ -45,6 +47,11 @@ class TypeOverride(StrEnum):
 class RowErrorPolicy(StrEnum):
     FAIL = "fail"
     SKIP = "skip"
+
+
+class Relation(StrEnum):
+    ONE = "one"  # 0 or 1 child row: an object, or null
+    MANY = "many"  # any number of child rows: an array
 
 
 def resolve_timezone(name: str) -> tzinfo:
@@ -90,6 +97,109 @@ class Settings(BaseModel):
         return resolve_timezone(self.naive_timestamp_timezone)
 
 
+# --- folded collections --------------------------------------------------------------
+
+
+def _valid_field_name(name: str) -> str:
+    if not name or name != name.strip():
+        raise ValueError("must not be empty or padded with spaces")
+    if name == "_id":
+        raise ValueError("'_id' is reserved for the primary key")
+    if name.startswith("$") or "." in name or "\x00" in name:
+        raise ValueError("is not a valid MongoDB field name (no '.', no leading '$')")
+    return name
+
+
+def _unique_aliases(embeds: list[EmbedSpec]) -> list[EmbedSpec]:
+    aliases = [embed.as_ for embed in embeds]
+    duplicates = sorted({alias for alias in aliases if aliases.count(alias) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate 'as' names at the same level: {', '.join(duplicates)}")
+    return embeds
+
+
+def _embed_depth(embeds: list[EmbedSpec]) -> int:
+    return 0 if not embeds else 1 + max(_embed_depth(embed.embed) for embed in embeds)
+
+
+def _embedded_tables(embeds: list[EmbedSpec]) -> set[str]:
+    tables: set[str] = set()
+    for embed in embeds:
+        tables.add(embed.table)
+        tables |= _embedded_tables(embed.embed)
+    return tables
+
+
+class EmbedSpec(BaseModel):
+    """One child table embedded into its parent's document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str
+    as_: str = Field(alias="as")
+    relation: Relation
+    join: dict[str, str] | None = None  # {child column: parent column}
+    keep_foreign_key: bool = False
+    embed: list[EmbedSpec] = Field(default_factory=list)
+
+    @field_validator("table")
+    @classmethod
+    def _table_must_not_be_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("as_")
+    @classmethod
+    def _alias_must_be_a_field_name(cls, value: str) -> str:
+        return _valid_field_name(value)
+
+    @field_validator("join")
+    @classmethod
+    def _join_must_not_be_empty(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is not None and not value:
+            raise ValueError("must map at least one child column to a parent column")
+        return value
+
+    @field_validator("embed")
+    @classmethod
+    def _sibling_aliases_must_be_unique(cls, value: list[EmbedSpec]) -> list[EmbedSpec]:
+        return _unique_aliases(value)
+
+
+EmbedSpec.model_rebuild()
+
+
+class CollectionSpec(BaseModel):
+    """A MongoDB collection built from a root table and its embedded children."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    from_: str = Field(alias="from")
+    embed: list[EmbedSpec] = Field(default_factory=list)
+
+    @field_validator("from_")
+    @classmethod
+    def _root_table_must_not_be_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("embed")
+    @classmethod
+    def _check_embeds(cls, value: list[EmbedSpec]) -> list[EmbedSpec]:
+        _unique_aliases(value)
+        if _embed_depth(value) > MAX_EMBED_DEPTH:
+            raise ValueError(f"embedding is nested more than {MAX_EMBED_DEPTH} levels deep")
+        return value
+
+    def embedded_tables(self) -> set[str]:
+        return _embedded_tables(self.embed)
+
+
+# --- the manifest ----------------------------------------------------------------------
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -100,6 +210,7 @@ class Manifest(BaseModel):
     target: Endpoint
     settings: Settings = Field(default_factory=Settings)
     tables: list[str] | None = None
+    collections: dict[str, CollectionSpec] = Field(default_factory=dict)
     type_overrides: dict[str, TypeOverride] = Field(default_factory=dict)
     transforms: dict[str, list[Rule]] = Field(default_factory=dict)
 
@@ -117,6 +228,18 @@ class Manifest(BaseModel):
         duplicates = sorted({name for name in value if value.count(name) > 1})
         if duplicates:
             raise ValueError(f"duplicate table names: {', '.join(duplicates)}")
+        return value
+
+    @field_validator("collections")
+    @classmethod
+    def _collection_names_must_be_valid(
+        cls, value: dict[str, CollectionSpec]
+    ) -> dict[str, CollectionSpec]:
+        for name in value:
+            if not name or name != name.strip():
+                raise ValueError("collection names must not be empty or padded with spaces")
+            if name.startswith("system.") or "$" in name or "\x00" in name:
+                raise ValueError(f"'{name}' is not a valid MongoDB collection name")
         return value
 
     @field_validator("type_overrides")
@@ -149,15 +272,36 @@ class Manifest(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _references_must_target_listed_tables(self) -> Self:
-        if self.tables is None:
+    def _collections_need_a_document_target(self) -> Self:
+        if self.collections and self.mode is not Mode.SQL_TO_NOSQL:
+            raise ValueError("collections (folded documents) need mode 'sql-to-nosql'")
+        clash = sorted(set(self.collections) & set(self.tables or []))
+        if clash:
+            raise ValueError(f"collection name(s) also listed in tables: {', '.join(clash)}")
+        return self
+
+    def used_tables(self) -> set[str] | None:
+        """Every table the pipeline reads, or None when all tables are copied."""
+        if self.tables is None and not self.collections:
+            return None
+        used = set(self.tables or [])
+        for spec in self.collections.values():
+            used.add(spec.from_)
+            used |= spec.embedded_tables()
+        return used
+
+    @model_validator(mode="after")
+    def _references_must_target_used_tables(self) -> Self:
+        used = self.used_tables()
+        if used is None:
             return self
         references = [("type_overrides", key.split(".", 1)[0]) for key in self.type_overrides]
         references += [("transforms", table) for table in self.transforms]
         for section, table in references:
-            if table not in self.tables:
+            if table not in used:
                 raise ValueError(
-                    f"{section} refers to table '{table}', which is not listed in tables"
+                    f"{section} refers to table '{table}', "
+                    "which is not listed in tables or collections"
                 )
         return self
 

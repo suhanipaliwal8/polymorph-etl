@@ -21,10 +21,13 @@ from polymorph.mongo_loader import LoadError
 from polymorph.pipeline import (
     TABLE_HEADER,
     PipelineError,
+    format_embedded_row,
     format_footer,
     format_table_row,
-    plan_table,
-    process_row,
+    make_counters,
+    plan_collection,
+    prefetch_children,
+    process_document,
     run_pipeline,
 )
 
@@ -83,8 +86,13 @@ def validate(
     typer.echo(f"  source: {url_scheme(manifest.source.url)}")
     typer.echo(f"  target: {url_scheme(manifest.target.url)}")
     typer.echo(f"  batch:  {manifest.settings.batch_size} rows")
-    tables = "all" if manifest.tables is None else str(len(manifest.tables))
+    if manifest.tables is None and not manifest.collections:
+        tables = "all"
+    else:
+        tables = str(len(manifest.tables or []))
     typer.echo(f"  tables: {tables}")
+    if manifest.collections:
+        typer.echo(f"  collections: {len(manifest.collections)}")
     rules = sum(len(table_rules) for table_rules in manifest.transforms.values())
     typer.echo(f"  rules:  {rules}")
 
@@ -158,7 +166,13 @@ def inspect_command(
 
 @app.command()
 def preview(
-    table_name: Annotated[str, typer.Argument(metavar="TABLE", help="Table to read.")],
+    table_name: Annotated[
+        str,
+        typer.Argument(
+            metavar="TABLE",
+            help="Table to read (with --manifest: a table or a collection of the manifest).",
+        ),
+    ],
     source_url: Annotated[
         Optional[str],
         typer.Option(
@@ -173,8 +187,8 @@ def preview(
         typer.Option(
             "--manifest",
             help=(
-                "Apply this pipeline's type translation and transform rules and "
-                "print the documents MongoDB would receive."
+                "Apply this pipeline's folding, type translation and transform rules "
+                "and print the documents MongoDB would receive."
             ),
         ),
     ] = None,
@@ -215,25 +229,37 @@ def preview(
     shown = scanned = rejected = filtered = 0
     try:
         plan = None
+        counters = {}
+        root_table = table_name
         if manifest is not None:
-            plan = plan_table(engine, table_name, manifest)
-            for note in (*plan.translator.notes, *plan.transform.notes):
+            plan = plan_collection(engine, table_name, manifest)
+            root_table = plan.root.name
+            counters = make_counters(plan)
+            for note in plan.notes:
                 typer.echo(f"-- note: {note}", err=True)
 
-        fetch_size = batch_size if plan is not None else min(batch_size, limit)
+        if plan is not None:
+            fetch_size = min(batch_size, max(limit * 5, 50))
+        else:
+            fetch_size = min(batch_size, limit)
+
         stop = False
-        batches = extract_batches(engine, table_name, batch_size=fetch_size, schema=schema)
+        batches = extract_batches(engine, root_table, batch_size=fetch_size, schema=schema)
         for number, batch in enumerate(batches, start=1):
             typer.echo(
                 f"-- batch {number}: {len(batch.rows)} rows fetched, cursor={batch.cursor}",
                 err=True,
             )
+            groups = {}
+            if plan is not None:
+                prefetch_children(engine, plan.embeds, batch.rows, groups)
+
             for row in batch.rows:
                 scanned += 1
                 if plan is None:
                     typer.echo(json.dumps(row, default=str, ensure_ascii=False))
                 else:
-                    outcome = process_row(plan, row)
+                    outcome = process_document(plan, row, groups, counters)
                     if outcome.rejection is not None:
                         rejected += 1
                         typer.echo(f"-- row rejected: {outcome.rejection}", err=True)
@@ -297,6 +323,8 @@ def run(
             typer.echo(TABLE_HEADER)
             header_printed = True
         typer.echo(format_table_row(result))
+        for embedded in result.embedded:
+            typer.echo(format_embedded_row(embedded))
         if result.rejected:
             shown = len(result.rejection_samples)
             typer.echo(f"  ! {result.rejected:,} row(s) rejected; first {shown} reason(s):")
@@ -308,7 +336,7 @@ def run(
     except (PipelineError, InspectError, ExtractError, LoadError) as exc:
         if header_printed:
             typer.echo(
-                "\nSome tables were already written. Re-running the same command "
+                "\nSome collections were already written. Re-running the same command "
                 "is safe: writes are idempotent.",
                 err=True,
             )
@@ -320,8 +348,8 @@ def run(
 
     if summary.rejected:
         typer.secho(
-            f"{summary.rejected:,} row(s) were rejected and skipped "
-            "(settings.on_row_error: skip). Only the first reasons per table are listed "
+            f"{summary.rejected:,} document(s)/row(s) were rejected and skipped "
+            "(settings.on_row_error: skip). Only the first reasons per collection are listed "
             "above; the dead-letter queue (Phase 10) will record every one.",
             fg=typer.colors.YELLOW,
             err=True,
