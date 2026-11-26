@@ -16,6 +16,7 @@ EXAMPLE = (
     / "postgres-to-mongo.yaml"
 )
 MASKED = EXAMPLE.with_name("postgres-to-mongo-masked.yaml")
+FOLDED = EXAMPLE.with_name("postgres-to-mongo-folded.yaml")
 
 
 def preview_env(shop_url):
@@ -219,3 +220,34 @@ def test_preview_with_a_manifest_skips_rejected_rows_and_says_why(shop_url):
     assert len(docs) == 47
     assert "***" in docs[0]["email"]
     assert "customer email is required" in result.output
+
+def test_validate_reports_collections(monkeypatch):
+    env = preview_env("postgresql+psycopg://user:secret@localhost:5433/shop")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    result = runner.invoke(app, ["validate", str(FOLDED)])
+
+    assert result.exit_code == 0
+    assert "collections: 1" in result.output
+    assert "secret" not in result.output
+
+
+def test_preview_shows_a_folded_document(shop_url):
+    result = runner.invoke(
+        app,
+        ["preview", "customers", "--manifest", str(FOLDED), "--limit", "50"],
+        env=preview_env(shop_url),
+    )
+
+    assert result.exit_code == 0
+    docs = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    with_orders = [doc for doc in docs if doc["orders"]]
+    assert with_orders
+    order = with_orders[0]["orders"][0]
+    assert "customer_id" not in order
+    assert "$numberDecimal" in order["items"][0]["unit_price"]
+    assert order["item_count"] == len(order["items"])
+    # Item 5 has a negative quantity: exactly one document is rejected.
+    assert len(docs) == 49
+    assert "quantity must be positive" in result.output

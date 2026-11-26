@@ -25,6 +25,12 @@ MASKED_EXAMPLE = (
     / "pipelines"
     / "postgres-to-mongo-masked.yaml"
 )
+FOLDED_EXAMPLE = (
+    Path(__file__).resolve().parent.parent
+    / "examples"
+    / "pipelines"
+    / "postgres-to-mongo-folded.yaml"
+)
 
 
 def source_counts(url):
@@ -267,3 +273,128 @@ def test_cli_run_exits_with_code_3_when_rows_were_rejected(shop_url, mongo_targe
     assert result.exit_code == 3
     assert "REJECTED" in result.output
     assert "customer email is required" in result.output
+
+def run_sql(url, sql):
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+    engine.dispose()
+
+
+ITEM_5_OWNER = (
+    "SELECT o.customer_id FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = 5"
+)
+QUANTITY_RULE = {
+    "order_items": [
+        {"type": "require", "expression": "quantity > 0", "message": "quantity must be positive"}
+    ]
+}
+
+
+def test_folded_collection_contains_nested_documents(
+    shop_url, mongo_target, make_manifest, folding_spec
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(shop_url, target_url, collections=folding_spec)
+
+    summary = run_pipeline(manifest)
+
+    assert db.list_collection_names() == ["customers"]
+    assert db.customers.count_documents({}) == 50
+    result = summary.tables[0]
+    assert [e.table for e in result.embedded] == ["customer_profiles", "orders", "order_items"]
+    assert summary.rows_read == sum(source_counts(shop_url).values())
+
+    doc = db.customers.find_one({"orders.0": {"$exists": True}, "profile": {"$ne": None}})
+    assert isinstance(doc["orders"][0]["items"][0]["unit_price"], Decimal128)
+    assert "customer_id" not in doc["orders"][0]
+
+
+def test_rerunning_a_folded_pipeline_changes_nothing(
+    shop_url, mongo_target, make_manifest, folding_spec
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(shop_url, target_url, collections=folding_spec)
+
+    run_pipeline(manifest)
+    second = run_pipeline(manifest)
+
+    result = second.tables[0]
+    assert (result.created, result.updated, result.unchanged) == (0, 0, 50)
+    assert db.customers.count_documents({}) == 50
+
+
+def test_a_document_with_an_invalid_embedded_row_is_rejected_and_the_rest_load(
+    shop_url, mongo_target, make_manifest, folding_spec
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url,
+        target_url,
+        collections=folding_spec,
+        transforms=QUANTITY_RULE,
+        settings={"on_row_error": "skip"},
+    )
+
+    result = run_pipeline(manifest).tables[0]
+    owner = source_scalar(shop_url, ITEM_5_OWNER)
+
+    assert result.rejected == 1
+    assert db.customers.count_documents({}) == 49
+    assert db.customers.find_one({"_id": owner}) is None
+    assert result.embedded[-1].table == "order_items"
+    assert result.embedded[-1].rejected == 1
+    assert result.rows_read == (
+        result.filtered + result.rejected + result.created + result.updated + result.unchanged
+    )
+
+
+def test_fixing_the_source_row_and_rerunning_repairs_the_missing_document(
+    shop_url, mongo_target, make_manifest, folding_spec
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url,
+        target_url,
+        collections=folding_spec,
+        transforms=QUANTITY_RULE,
+        settings={"on_row_error": "skip"},
+    )
+    run_pipeline(manifest)
+
+    run_sql(shop_url, "UPDATE order_items SET quantity = 3 WHERE id = 5")
+    second = run_pipeline(manifest).tables[0]
+
+    assert second.created == 1
+    assert second.updated == 0
+    assert second.rejected == 0
+    assert db.customers.count_documents({}) == 50
+
+
+def test_flat_tables_and_folded_collections_can_be_mixed(
+    shop_url, mongo_target, make_manifest, folding_spec
+):
+    target_url, db = mongo_target
+    manifest = make_manifest(
+        shop_url, target_url, collections=folding_spec, tables=["customer_profiles"]
+    )
+
+    run_pipeline(manifest)
+
+    assert sorted(db.list_collection_names()) == ["customer_profiles", "customers"]
+    assert db.customer_profiles.count_documents({}) == 45
+    assert db.customers.count_documents({}) == 50
+
+
+def test_cli_run_of_the_folded_example(shop_url, mongo_target):
+    target_url, _ = mongo_target
+
+    result = CliRunner().invoke(
+        app,
+        ["run", str(FOLDED_EXAMPLE)],
+        env={"SOURCE_URL": shop_url, "TARGET_URL": target_url},
+    )
+
+    assert result.exit_code == 3  # item 5 is a poison record
+    assert "+ order_items" in result.output
+    assert "quantity must be positive" in result.output
