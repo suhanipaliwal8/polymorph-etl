@@ -119,3 +119,57 @@ def _stream(
 
         if len(rows) < batch_size:
             return  # a short batch means the table is exhausted
+
+
+
+RELATED_CHUNK_SIZE = 500  # keys per query: keeps the number of bind parameters small
+
+
+def fetch_related(
+    engine: Engine,
+    table: Table,
+    columns: Sequence[str],
+    keys: Sequence[Cursor],
+    chunk_size: int = RELATED_CHUNK_SIZE,
+) -> list[dict[str, Any]]:
+    """Fetch every row of `table` whose `columns` equal one of `keys`.
+
+    One query per chunk of keys (`WHERE col IN (...)`), never one query per
+    parent row. Rows are ordered by primary key inside each chunk, so the rows
+    of one parent always come back in a stable order. Composite keys use the
+    portable `(a = x AND b = y) OR ...` form.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
+
+    pk_columns = list(table.primary_key.columns)
+    if not pk_columns:
+        raise ExtractError(
+            f"Table '{table.name}' has no primary key; embedded rows need one "
+            "to be ordered and identified"
+        )
+    try:
+        key_columns = [table.c[name] for name in columns]
+    except KeyError as exc:
+        raise ExtractError(f"Table '{table.name}' has no column {exc}") from exc
+
+    per_query = max(1, chunk_size // len(key_columns))
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(keys), per_query):
+        chunk = keys[start : start + per_query]
+        if len(key_columns) == 1:
+            condition = key_columns[0].in_([key[0] for key in chunk])
+        else:
+            condition = or_(
+                *[
+                    and_(*[column == value for column, value in zip(key_columns, key)])
+                    for key in chunk
+                ]
+            )
+        query = select(table).where(condition).order_by(*pk_columns)
+        try:
+            with engine.connect() as conn:
+                rows.extend(dict(row) for row in conn.execute(query).mappings())
+        except DBAPIError as exc:
+            raise ExtractError(_describe(exc)) from exc
+    return rows

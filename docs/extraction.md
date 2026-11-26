@@ -39,3 +39,10 @@ which not every database supports.
   not seen. Live changes are the job of CDC (stretch goal).
 - Ordering and comparison happen in the database, so text keys follow the
   database's collation consistently.
+
+
+## Fetching related rows (folding)
+Folded collections need the children of every row in a batch. Instead of one
+query per parent row (the N+1 problem), `fetch_related` runs one query per
+chunk of 500 parent keys (`WHERE fk IN (...)`, or an `OR` of `AND`s for
+composite keys), ordered by primary key. See [`folding.md`](folding.md).
