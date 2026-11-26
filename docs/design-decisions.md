@@ -218,3 +218,48 @@ write and review, and gives the CLI an end-to-end test that needs no MongoDB.
 ## 37. URL helpers live in their own module
 `polymorph.urls` removes a circular import between the manifest (which now
 imports the transform rules) and the inspector.
+
+## 38. Folding is declarative and reads the schema
+`collections` in the manifest describe the shape (root table, embeds,
+`one`/`many`); the join columns come from the foreign keys in the database.
+`join: {child: parent}` covers undeclared or ambiguous keys. The key is
+called `join` because an unquoted `on` is parsed by YAML as a boolean.
+
+## 39. Children are fetched in batches, not per parent
+For each batch of root rows one query per embedded table fetches all children
+(`WHERE fk IN (...)`, 500 keys per chunk), which are grouped in memory. A
+single SQL JOIN would duplicate parent columns and break keyset `LIMIT`;
+per-parent queries are the N+1 problem. Memory per batch is roughly
+`batch_size` times the average family size.
+
+## 40. Cardinality is explicit and the shape is predictable
+`one` gives an object or `null`, `many` gives an array that is always present
+(empty when there are no rows). A `one` relation that the database does not
+enforce is announced, and a parent with two matching rows is rejected.
+
+## 41. Documents are all-or-nothing
+A rejected embedded row rejects its whole document instead of silently
+shipping an incomplete one. The reason names the failing row and the
+document; rerunning after fixing the source repairs just that document.
+Oversized documents (16 MB) and 1:1 violations are rejected the same way.
+
+## 42. Stable ordering keeps reruns idempotent
+Embedded rows are ordered by primary key, so a rerun produces byte-identical
+documents and MongoDB reports them unchanged.
+
+## 43. Foreign key columns disappear from embedded rows
+The nesting expresses the relationship, so the child's foreign key columns
+are removed (`keep_foreign_key` keeps them). Embedded rows keep their primary
+key as an ordinary field; only the root's key becomes `_id`.
+
+## 44. A table's rules run after its children are embedded
+Rules can therefore read embedded fields (`len(items)`, `profile is not
+None`). Filtering an embedded table removes its rows from the array, which
+also resolves the Phase 7 "orphaned rows" limitation. The `_id` collision
+check applies to root tables only.
+
+## 45. Safety nets against silent data loss
+If the database matches a child to a parent but Python's key comparison does
+not (case-insensitive collation, padded text), the run stops instead of
+dropping the row. Counters are kept per embedded table, so source rows can be
+reconciled against documents.
