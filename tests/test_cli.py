@@ -1,3 +1,4 @@
+import pytest
 import json
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from typer.testing import CliRunner
 from polymorph import __version__
 from polymorph.cli import app
 from polymorph.manifest import load_manifest
+from polymorph.checkpoint import CheckpointStore, Progress, checkpoint_path
 
 runner = CliRunner()
 
@@ -251,3 +253,46 @@ def test_preview_shows_a_folded_document(shop_url):
     # Item 5 has a negative quantity: exactly one document is rejected.
     assert len(docs) == 49
     assert "quantity must be positive" in result.output
+
+STATUS_ENV = {
+    "SOURCE_URL": "postgresql+psycopg://user:secret@localhost:5433/shop",
+    "TARGET_URL": "mongodb://localhost:27018/shop",
+}
+
+
+def test_fresh_and_no_checkpoint_cannot_be_combined():
+    result = runner.invoke(app, ["run", str(EXAMPLE), "--fresh", "--no-checkpoint"])
+    assert result.exit_code == 2
+
+
+@pytest.mark.parametrize("spec", ["later:3", "written:0", "written", "written:x"])
+def test_crash_at_must_be_a_stage_and_a_positive_number(spec):
+    result = runner.invoke(app, ["run", str(EXAMPLE), "--crash-at", spec])
+    assert result.exit_code == 2
+
+
+def test_status_without_saved_progress(tmp_path):
+    result = runner.invoke(
+        app, ["status", str(EXAMPLE), "--state-dir", str(tmp_path / "state")], env=STATUS_ENV
+    )
+    assert result.exit_code == 0
+    assert "no saved progress" in result.output
+    assert not (tmp_path / "state").exists()  # status never creates files
+
+
+def test_status_lists_the_saved_collections(tmp_path):
+    state = tmp_path / "state"
+    with CheckpointStore(checkpoint_path(state, "shop-to-mongo")) as store:
+        store.save_progress("customers", "fp", (14,), Progress(rows_read=14))
+        store.mark_done("orders", "fp", Progress(rows_read=410))
+
+    result = runner.invoke(
+        app, ["status", str(EXAMPLE), "--state-dir", str(state)], env=STATUS_ENV
+    )
+
+    assert result.exit_code == 0
+    assert "customers" in result.output
+    assert "in progress" in result.output
+    assert "completed" in result.output
+    assert "410" in result.output
+    assert "secret" not in result.output
