@@ -119,5 +119,10 @@ pre-flight checks and the pipeline pick it up automatically.
 ## Limits
 - Rules work on one row at a time: no cross-row or cross-table logic until
   join folding (Phase 8).
-- Filtering a table does not filter tables that refer to it, so a flat copy
-  can contain orphaned rows.
+- In a flat copy, filtering a table does not filter tables that refer to it,
+  so orphaned rows are possible. Folding removes the problem: the rows of a
+  filtered child disappear with it.
+- Rules work on one row at a time. With folded collections a table's rules run
+  after its children were embedded, so they can read embedded fields (for
+  example `len(orders)`); see `folding.md`. There is no cross-table logic
+  beyond that.

@@ -3,6 +3,9 @@
 ## Layout (flat copy)
 Each source table becomes one collection with the same name; each row becomes
 one document. Folding related tables into nested documents is Phase 8.
+Related tables can be folded into one document with `collections`; the
+embedded rows are translated and transformed like any other row. See
+[`folding.md`](folding.md).
 
 ## The `_id` field
 - Single-column primary key: `_id` is that value. The key column is not
