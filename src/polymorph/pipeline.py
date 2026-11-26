@@ -1,18 +1,31 @@
 """End-to-end pipeline execution: extract, fold related tables, translate types,
-transform and load."""
+transform, load, and resume after a crash from checkpoints."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import bson
 from bson.errors import BSONError
 from pymongo.errors import InvalidName
 from sqlalchemy import Table
 
+from polymorph.checkpoint import (
+    CheckpointStore,
+    Cursor,
+    Progress,
+    RunLock,
+    checkpoint_path,
+    keys_can_be_checkpointed,
+    lock_path,
+)
 from polymorph.extractor import ExtractError, extract_batches, fetch_related, reflect_table
 from polymorph.inspector import create_source_engine, inspect_database
 from polymorph.manifest import EmbedSpec, Manifest, Mode, Relation, RowErrorPolicy
@@ -27,6 +40,7 @@ from polymorph.translate import TranslationError, Translator, build_translator
 
 MAX_REJECTION_SAMPLES = 10
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024  # MongoDB's limit for a single document
+FINGERPRINT_VERSION = 1
 
 # label of an embedded table -> {join key -> that key's child rows, in primary-key order}
 Groups = dict[str, dict[tuple[Any, ...], list[dict[str, Any]]]]
@@ -53,7 +67,8 @@ class EmbeddedResult:
 
 @dataclass(frozen=True)
 class TableResult:
-    """Result for one collection. Counts are DOCUMENTS (root rows)."""
+    """Result for one collection. Counts are DOCUMENTS (root rows), cumulative across
+    interrupted attempts."""
 
     table: str
     rows_read: int
@@ -65,6 +80,8 @@ class TableResult:
     rejected: int = 0
     rejection_samples: tuple[str, ...] = ()
     embedded: tuple[EmbeddedResult, ...] = ()
+    resumed: bool = False  # continued from a checkpoint
+    skipped: bool = False  # finished by an earlier attempt; not run again
 
 
 @dataclass(frozen=True)
@@ -125,6 +142,7 @@ class CollectionPlan:
     name: str
     root: TablePlan
     embeds: tuple[EmbedPlan, ...] = ()
+    resume_problem: str | None = None  # set when the root key cannot be checkpointed
 
     def embed_nodes(self) -> list[EmbedPlan]:
         """Every embedded table, parents before children."""
@@ -143,6 +161,11 @@ class CollectionPlan:
         notes = [*self.root.translator.notes, *self.root.transform.notes]
         for node in self.embed_nodes():
             notes.extend((*node.notes, *node.table.translator.notes, *node.table.transform.notes))
+        if self.resume_problem is not None:
+            notes.append(
+                f"{self.name}: {self.resume_problem}; this collection cannot resume "
+                "after an interruption"
+            )
         return notes
 
 
@@ -209,8 +232,19 @@ def run_pipeline(
     manifest: Manifest,
     on_plan: Callable[[Sequence[str]], None] | None = None,
     on_table_done: Callable[[TableResult], None] | None = None,
+    state_dir: Path | None = None,
+    fresh: bool = False,
+    on_notice: Callable[[str], None] | None = None,
+    on_batch: Callable[[str, str, int], None] | None = None,
 ) -> RunSummary:
-    """Run a pipeline. Every check happens before the first write."""
+    """Run a pipeline. Every check happens before the first write.
+
+    With `state_dir`, progress is checkpointed after every batch and an
+    interrupted run resumes from its checkpoint. `on_batch(stage, collection,
+    batch_number)` is called with stage "written" (data is in MongoDB, the
+    checkpoint is not yet) and "checkpointed"; tests and the demo use it to
+    inject a crash.
+    """
     if manifest.mode is not Mode.SQL_TO_NOSQL:
         raise PipelineError(
             "Mode 'sql-to-sql' is not available yet (planned for Phase 13); "
@@ -218,14 +252,18 @@ def run_pipeline(
         )
 
     started = time.perf_counter()
-    if manifest.collections or manifest.tables is not None:
-        flat_tables = list(manifest.tables or [])
-    else:
-        flat_tables = _discover_tables(manifest.source.url)
-
-    source = create_source_engine(manifest.source.url)
-    client = None
+    lock = store = client = source = None
     try:
+        if state_dir is not None:
+            lock = RunLock(lock_path(state_dir, manifest.name))
+            lock.acquire()  # one run per pipeline at a time
+
+        if manifest.collections or manifest.tables is not None:
+            flat_tables = list(manifest.tables or [])
+        else:
+            flat_tables = _discover_tables(manifest.source.url)
+
+        source = create_source_engine(manifest.source.url)
         plans = _plan_collections(source, flat_tables, manifest)  # pre-flight: source side
         client, database = connect(manifest.target.url)  # pre-flight: MongoDB reachable
 
@@ -241,18 +279,25 @@ def run_pipeline(
         if on_plan is not None:
             on_plan([note for plan in plans for note in plan.notes])
 
+        states = {}
+        if state_dir is not None:
+            store = CheckpointStore(checkpoint_path(state_dir, manifest.name), fresh=fresh)
+            states = store.load()
+            for name in sorted(set(states) - {plan.name for plan in plans}):
+                store.discard(name)  # a collection that is no longer in the manifest
+
         results = []
         for plan in plans:
-            result = _copy_collection(
-                source,
-                mongo_collections[plan.name],
-                plan,
-                manifest.settings.batch_size,
-                manifest.settings.on_row_error,
+            result = _run_collection(
+                source, mongo_collections[plan.name], plan, manifest,
+                store, states.get(plan.name), on_notice, on_batch,
             )
             results.append(result)
             if on_table_done is not None:
                 on_table_done(result)
+
+        if store is not None:
+            store.clear()  # a finished run leaves nothing to resume
 
         return RunSummary(
             pipeline=manifest.name,
@@ -262,9 +307,70 @@ def run_pipeline(
             seconds=time.perf_counter() - started,
         )
     finally:
-        source.dispose()
+        if source is not None:
+            source.dispose()
         if client is not None:
             client.close()
+        if store is not None:
+            store.close()
+        if lock is not None:
+            lock.release()
+
+
+def _notice(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _run_collection(
+    source,
+    collection,
+    plan: CollectionPlan,
+    manifest: Manifest,
+    store: CheckpointStore | None,
+    state,
+    on_notice: Callable[[str], None] | None,
+    on_batch: Callable[[str, str, int], None] | None,
+) -> TableResult:
+    """Decide how one collection starts (fresh, resumed or skipped), then copy it."""
+    checkpointing = store is not None and plan.resume_problem is None
+    fingerprint = collection_fingerprint(manifest, plan) if checkpointing else ""
+    after: Cursor | None = None
+    progress = Progress()
+    resumed = False
+
+    if checkpointing and state is not None:
+        if state.fingerprint != fingerprint:
+            store.discard(plan.name)
+            _notice(
+                on_notice,
+                f"{plan.name}: the configuration or the source schema changed since the "
+                "interrupted run; this collection restarts from the beginning",
+            )
+        elif state.status == "done":
+            _notice(on_notice, f"{plan.name}: already completed by the interrupted run; skipped")
+            return _result_from_progress(plan, state.progress)
+        else:
+            after, progress, resumed = state.cursor, state.progress, True
+            _notice(
+                on_notice,
+                f"{plan.name}: resuming; {progress.rows_read:,} root rows were already "
+                "processed",
+            )
+
+    return _copy_collection(
+        source,
+        collection,
+        plan,
+        manifest.settings.batch_size,
+        manifest.settings.on_row_error,
+        store=store if checkpointing else None,
+        fingerprint=fingerprint,
+        after=after,
+        progress=progress,
+        resumed=resumed,
+        on_batch=on_batch,
+    )
 
 
 def _discover_tables(url: str) -> list[str]:
@@ -304,7 +410,9 @@ def plan_table(
     root: bool = True,
 ) -> TablePlan:
     """Reflect one table and validate everything that will be applied to it."""
-    return _plan_reflected(source, reflect_table(source, name), manifest, extra_fields, removed_columns, root)
+    return _plan_reflected(
+        source, reflect_table(source, name), manifest, extra_fields, removed_columns, root
+    )
 
 
 def _plan_reflected(
@@ -363,7 +471,13 @@ def plan_collection(source, name: str, manifest: Manifest) -> CollectionPlan:
     """Plan a folded collection, or a flat copy when `name` is not a declared collection."""
     spec = manifest.collections.get(name)
     if spec is None:
-        return CollectionPlan(name=name, root=plan_table(source, name, manifest))
+        table = reflect_table(source, name)
+        root = _plan_reflected(source, table, manifest, (), (), True)
+        return CollectionPlan(
+            name=name,
+            root=root,
+            resume_problem=keys_can_be_checkpointed(table.primary_key.columns),
+        )
 
     root_table = reflect_table(source, spec.from_)
     root = _plan_reflected(
@@ -375,7 +489,12 @@ def plan_collection(source, name: str, manifest: Manifest) -> CollectionPlan:
         root=True,
     )
     embeds = tuple(_plan_embed(source, root_table, embed, name, 1, manifest) for embed in spec.embed)
-    return CollectionPlan(name=name, root=root, embeds=embeds)
+    return CollectionPlan(
+        name=name,
+        root=root,
+        embeds=embeds,
+        resume_problem=keys_can_be_checkpointed(root_table.primary_key.columns),
+    )
 
 
 def _plan_embed(
@@ -462,6 +581,85 @@ def _resolve_join(
         tuple(column.name for column in fk.columns),
         tuple(element.column.name for element in fk.elements),
     )
+
+
+# --- the fingerprint of a collection ----------------------------------------------------------
+# A saved cursor only makes sense for the configuration that produced it. The
+# fingerprint is a hash of everything that shapes the documents, never of
+# credentials (only scheme, host and database of each URL are used).
+
+
+def _identity(url: str) -> str:
+    parts = urlsplit(url)
+    host = parts.netloc.rpartition("@")[2].lower()  # drop "user:password@"
+    return f"{parts.scheme.lower()}://{host}{parts.path}"
+
+
+def _redact_salts(value: Any) -> Any:
+    """Replace secret salts by their own hash: a changed salt still changes the fingerprint."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                hashlib.sha256(item.encode("utf-8")).hexdigest()
+                if key == "salt" and isinstance(item, str)
+                else _redact_salts(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_salts(item) for item in value]
+    return value
+
+
+def _embed_signature(embed: EmbedPlan) -> dict[str, Any]:
+    return {
+        "alias": embed.alias,
+        "table": embed.table.name,
+        "relation": embed.relation.value,
+        "child_columns": list(embed.child_columns),
+        "parent_columns": list(embed.parent_columns),
+        "removed_columns": list(embed.removed_columns),
+        "children": [_embed_signature(child) for child in embed.children],
+    }
+
+
+def _table_signature(plan: TablePlan) -> dict[str, Any]:
+    return {
+        "primary_key": plan.pk_names,
+        "columns": [[mapping.name, mapping.sql_type] for mapping in plan.translator.mappings],
+    }
+
+
+def collection_fingerprint(manifest: Manifest, plan: CollectionPlan) -> str:
+    """SHA-256 of everything that determines the documents of one collection."""
+    table_plans = {plan.root.name: plan.root}
+    for node in plan.embed_nodes():
+        table_plans[node.table.name] = node.table
+    tables = sorted(table_plans)
+
+    payload = {
+        "version": FINGERPRINT_VERSION,
+        "mode": manifest.mode.value,
+        "source": _identity(manifest.source.url),
+        "target": _identity(manifest.target.url),
+        "collection": plan.name,
+        "root": plan.root.name,
+        "embeds": [_embed_signature(embed) for embed in plan.embeds],
+        "schema": {name: _table_signature(table_plans[name]) for name in tables},
+        "transforms": {
+            name: _redact_salts([rule.model_dump(mode="json") for rule in manifest.transforms[name]])
+            for name in tables
+            if name in manifest.transforms
+        },
+        "type_overrides": {
+            key: kind.value
+            for key, kind in sorted(manifest.type_overrides.items())
+            if key.split(".", 1)[0] in tables
+        },
+        "naive_timestamp_timezone": manifest.settings.naive_timestamp_timezone,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # --- fetching children ---------------------------------------------------------------------
@@ -648,16 +846,94 @@ def process_document(
     return RowOutcome(document=document)
 
 
+# --- copying one collection, with checkpoints --------------------------------------------------
+
+
+def _embedded_results(
+    plan: CollectionPlan, values: Mapping[str, tuple[int, int, int]]
+) -> tuple[EmbeddedResult, ...]:
+    results = []
+    for node in plan.embed_nodes():
+        read, filtered, rejected = values.get(node.label, (0, 0, 0))
+        results.append(
+            EmbeddedResult(
+                label=node.label,
+                table=node.table.name,
+                depth=node.depth,
+                rows_read=read,
+                filtered=filtered,
+                rejected=rejected,
+            )
+        )
+    return tuple(results)
+
+
+def _result_from_progress(plan: CollectionPlan, progress: Progress) -> TableResult:
+    """The result of a collection that an earlier attempt already finished."""
+    return TableResult(
+        table=plan.name,
+        rows_read=progress.rows_read,
+        created=progress.created,
+        updated=progress.updated,
+        unchanged=progress.unchanged,
+        seconds=0.0,
+        filtered=progress.filtered,
+        rejected=progress.rejected,
+        embedded=_embedded_results(plan, progress.embedded),
+        skipped=True,
+    )
+
+
+def _snapshot(
+    rows_read: int,
+    filtered: int,
+    rejected: int,
+    stats: LoadStats,
+    counters: dict[str, _Counter],
+) -> Progress:
+    return Progress(
+        rows_read=rows_read,
+        filtered=filtered,
+        rejected=rejected,
+        created=stats.created,
+        updated=stats.updated,
+        unchanged=stats.unchanged,
+        embedded={
+            label: (counter.read, counter.filtered, counter.rejected)
+            for label, counter in counters.items()
+        },
+    )
+
+
 def _copy_collection(
-    source, collection, plan: CollectionPlan, batch_size: int, on_row_error: RowErrorPolicy
+    source,
+    collection,
+    plan: CollectionPlan,
+    batch_size: int,
+    on_row_error: RowErrorPolicy,
+    *,
+    store: CheckpointStore | None = None,
+    fingerprint: str = "",
+    after: Cursor | None = None,
+    progress: Progress | None = None,
+    resumed: bool = False,
+    on_batch: Callable[[str, str, int], None] | None = None,
 ) -> TableResult:
     started = time.perf_counter()
-    rows_read = filtered = rejected = 0
-    samples: list[str] = []
-    stats = LoadStats(0, 0, 0)
-    counters = make_counters(plan)
+    progress = progress or Progress()
 
-    for batch in extract_batches(source, plan.root.name, batch_size=batch_size):
+    # Start from the counters of the earlier attempt (all zero for a fresh start).
+    rows_read, filtered, rejected = progress.rows_read, progress.filtered, progress.rejected
+    stats = LoadStats(progress.created, progress.updated, progress.unchanged)
+    counters = make_counters(plan)
+    for label, (read, flt, rej) in progress.embedded.items():
+        if label in counters:
+            counters[label].read, counters[label].filtered, counters[label].rejected = read, flt, rej
+    samples: list[str] = []
+
+    batch_number = 0
+    for batch in extract_batches(source, plan.root.name, batch_size=batch_size, after=after):
+        batch_number += 1
         groups: Groups = {}
         prefetch_children(source, plan.embeds, batch.rows, groups)
 
@@ -683,17 +959,24 @@ def _copy_collection(
         stats += write_documents(collection, documents)
         rows_read += len(batch.rows)
 
-    embedded = tuple(
-        EmbeddedResult(
-            label=node.label,
-            table=node.table.name,
-            depth=node.depth,
-            rows_read=counters[node.label].read,
-            filtered=counters[node.label].filtered,
-            rejected=counters[node.label].rejected,
-        )
-        for node in plan.embed_nodes()
-    )
+        if on_batch is not None:
+            on_batch("written", plan.name, batch_number)  # data is in MongoDB, checkpoint is not
+
+        # Write first, checkpoint second: a crash between the two repeats this
+        # batch on resume, which is harmless because the writes are idempotent.
+        if store is not None:
+            store.save_progress(
+                plan.name, fingerprint, batch.cursor,
+                _snapshot(rows_read, filtered, rejected, stats, counters),
+            )
+
+        if on_batch is not None:
+            on_batch("checkpointed", plan.name, batch_number)
+
+    final = _snapshot(rows_read, filtered, rejected, stats, counters)
+    if store is not None:
+        store.mark_done(plan.name, fingerprint, final)
+
     return TableResult(
         table=plan.name,
         rows_read=rows_read,
@@ -704,5 +987,6 @@ def _copy_collection(
         filtered=filtered,
         rejected=rejected,
         rejection_samples=tuple(samples),
-        embedded=embedded,
+        embedded=_embedded_results(plan, final.embedded),
+        resumed=resumed,
     )
