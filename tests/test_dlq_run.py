@@ -1,3 +1,7 @@
+from typer.testing import CliRunner
+
+from polymorph.cli import app
+
 import json
 from pathlib import Path
 
@@ -322,3 +326,34 @@ def test_a_restarted_collection_does_not_leave_stale_entries(
 
     assert any("restarts from the beginning" in notice for notice in notices)
     assert len(entries(dlq)) == 4  # the three customers and item 5, each exactly once
+
+FOLDED_EXAMPLE = (
+    Path(__file__).resolve().parent.parent
+    / "examples"
+    / "pipelines"
+    / "postgres-to-mongo-folded.yaml"
+)
+
+
+def test_cli_run_reports_the_dead_letter_file_and_dlq_summarises_it(
+    shop_url, mongo_target, tmp_path
+):
+    target_url, _ = mongo_target
+    env = {"SOURCE_URL": shop_url, "TARGET_URL": target_url}
+    state = str(tmp_path / "state")
+
+    run_result = CliRunner().invoke(
+        app, ["run", str(FOLDED_EXAMPLE), "--state-dir", state], env=env
+    )
+
+    assert run_result.exit_code == 3
+    assert "dlq_errors.jsonl" in run_result.output
+    assert "1 entry" in run_result.output
+
+    dlq_result = CliRunner().invoke(
+        app, ["dlq", str(FOLDED_EXAMPLE), "--state-dir", state], env=env
+    )
+
+    assert dlq_result.exit_code == 0
+    assert "order_items" in dlq_result.output
+    assert "quantity must be positive" in dlq_result.output

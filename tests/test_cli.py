@@ -8,6 +8,7 @@ from polymorph import __version__
 from polymorph.cli import app
 from polymorph.manifest import load_manifest
 from polymorph.checkpoint import CheckpointStore, Progress, checkpoint_path
+from polymorph.dlq import Rejection, dead_letter_path, format_entry
 
 runner = CliRunner()
 
@@ -296,3 +297,64 @@ def test_status_lists_the_saved_collections(tmp_path):
     assert "completed" in result.output
     assert "410" in result.output
     assert "secret" not in result.output
+
+def write_dead_letters(path, count=2):
+    cause = Rejection(
+        stage="transform",
+        table="order_items",
+        key={"id": 5},
+        reason="quantity must be positive",
+        message="order_items: quantity must be positive (row id=5)",
+    )
+    lines = [
+        format_entry("shop-to-mongo", "customers", "customers", {"id": 17 + i}, cause)
+        for i in range(count)
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_dlq_command_summarises_the_file(tmp_path):
+    state = tmp_path / "state"
+    write_dead_letters(dead_letter_path(state, "shop-to-mongo"))
+
+    result = runner.invoke(
+        app, ["dlq", str(EXAMPLE), "--state-dir", str(state)], env=STATUS_ENV
+    )
+
+    assert result.exit_code == 0
+    assert "2 entries" in result.output
+    assert "order_items" in result.output
+    assert "quantity must be positive" in result.output
+    assert "customers id=17 <- order_items id=5" in result.output
+
+
+def test_dlq_command_on_an_empty_file(tmp_path):
+    path = tmp_path / "empty.jsonl"
+    path.write_bytes(b"")
+
+    result = runner.invoke(app, ["dlq", str(EXAMPLE), "--file", str(path)], env=STATUS_ENV)
+
+    assert result.exit_code == 0
+    assert "No rejected rows" in result.output
+
+
+def test_dlq_command_without_a_file_fails_politely(tmp_path):
+    result = runner.invoke(
+        app, ["dlq", str(EXAMPLE), "--state-dir", str(tmp_path / "state")], env=STATUS_ENV
+    )
+    assert result.exit_code == 1
+    assert "No dead-letter file" in result.output
+
+
+def test_status_mentions_the_dead_letter_file(tmp_path):
+    state = tmp_path / "state"
+    write_dead_letters(dead_letter_path(state, "shop-to-mongo"), count=3)
+
+    result = runner.invoke(
+        app, ["status", str(EXAMPLE), "--state-dir", str(state)], env=STATUS_ENV
+    )
+
+    assert result.exit_code == 0
+    assert "no saved progress" in result.output
+    assert "3 entries" in result.output
