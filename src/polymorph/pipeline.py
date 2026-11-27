@@ -1,5 +1,5 @@
 """End-to-end pipeline execution: extract, fold related tables, translate types,
-transform, load, and resume after a crash from checkpoints."""
+transform, load, dead-letter rejected documents, and resume after a crash."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,6 +26,7 @@ from polymorph.checkpoint import (
     keys_can_be_checkpointed,
     lock_path,
 )
+from polymorph.dlq import DeadLetterWriter, Rejection, format_entry
 from polymorph.extractor import ExtractError, extract_batches, fetch_related, reflect_table
 from polymorph.inspector import create_source_engine, inspect_database
 from polymorph.manifest import EmbedSpec, Manifest, Mode, Relation, RowErrorPolicy
@@ -174,14 +175,15 @@ class RowOutcome:
     """What happened to one row.
 
     document set      -> the row is ready (a nested document for embedded tables)
-    rejection set     -> the row is invalid; `propagated` is True when the cause
-                         is an embedded row further down
+    rejection set     -> the row is invalid; `detail` says why in a structured way, and
+                         `propagated` is True when the cause is an embedded row further down
     both None         -> a filter rule dropped the row
     """
 
     document: dict[str, Any] | None = None
     rejection: str | None = None
     propagated: bool = False
+    detail: Rejection | None = None
 
 
 @dataclass
@@ -228,6 +230,11 @@ def format_footer(summary: RunSummary) -> str:
 # --- running ----------------------------------------------------------------------------
 
 
+def _notice(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
 def run_pipeline(
     manifest: Manifest,
     on_plan: Callable[[Sequence[str]], None] | None = None,
@@ -236,13 +243,17 @@ def run_pipeline(
     fresh: bool = False,
     on_notice: Callable[[str], None] | None = None,
     on_batch: Callable[[str, str, int], None] | None = None,
+    dlq_path: Path | None = None,
 ) -> RunSummary:
     """Run a pipeline. Every check happens before the first write.
 
     With `state_dir`, progress is checkpointed after every batch and an
-    interrupted run resumes from its checkpoint. `on_batch(stage, collection,
-    batch_number)` is called with stage "written" (data is in MongoDB, the
-    checkpoint is not yet) and "checkpointed"; tests and the demo use it to
+    interrupted run resumes from its checkpoint. With `dlq_path`, every rejected
+    document is recorded in a dead-letter file.
+
+    `on_batch(stage, collection, batch_number)` is called with stage "written"
+    (documents are in MongoDB and the dead letters are in the file, but the
+    checkpoint is not saved yet) and "checkpointed". Tests and the demo use it to
     inject a crash.
     """
     if manifest.mode is not Mode.SQL_TO_NOSQL:
@@ -276,6 +287,11 @@ def run_pipeline(
                     f"'{plan.name}' is not a valid MongoDB collection name"
                 ) from exc
 
+        # Pre-flight: the dead-letter file can be opened (it is not truncated here).
+        dlq = None
+        if dlq_path is not None:
+            dlq = DeadLetterWriter(dlq_path, manifest.name, manifest.settings.dlq_include_rows)
+
         if on_plan is not None:
             on_plan([note for plan in plans for note in plan.notes])
 
@@ -287,11 +303,87 @@ def run_pipeline(
                 store.discard(name)  # a collection that is no longer in the manifest
 
         results = []
+        # All collections share one dead-letter file, so their saved offsets form a
+        # chain. `chain_ok` turns False as soon as a collection runs or starts over:
+        # saved progress of the collections after it no longer fits the file.
+        chain_ok = True
+        base = 0  # size of the dead-letter file that belongs to the collections before this one
         for plan in plans:
-            result = _run_collection(
-                source, mongo_collections[plan.name], plan, manifest,
-                store, states.get(plan.name), on_notice, on_batch,
-            )
+            checkpointing = store is not None and plan.resume_problem is None
+            fingerprint = collection_fingerprint(manifest, plan) if checkpointing else ""
+            state = states.get(plan.name) if checkpointing else None
+
+            kind = "fresh"
+            if state is not None:
+                if not chain_ok:
+                    store.discard(plan.name)
+                    _notice(
+                        on_notice,
+                        f"{plan.name}: saved progress ignored because an earlier collection "
+                        "starts over; this collection restarts from the beginning",
+                    )
+                elif state.fingerprint != fingerprint:
+                    store.discard(plan.name)
+                    _notice(
+                        on_notice,
+                        f"{plan.name}: the configuration or the source schema changed since the "
+                        "interrupted run; this collection restarts from the beginning",
+                    )
+                elif state.status == "done":
+                    kind = "skip"
+                else:
+                    kind = "resume"
+
+            if kind == "skip":
+                if dlq is not None:
+                    dlq.require(state.dlq_offset)
+                base = max(base, state.dlq_offset)
+                _notice(
+                    on_notice, f"{plan.name}: already completed by the interrupted run; skipped"
+                )
+                result = _result_from_progress(plan, state.progress)
+            else:
+                chain_ok = False
+                after: Cursor | None = None
+                progress = Progress()
+                resumed = False
+                if kind == "resume":
+                    after, progress, resumed = state.cursor, state.progress, True
+                    if dlq is not None:
+                        dlq.truncate(state.dlq_offset)  # drop the entries of the unfinished batch
+                        if state.dlq_offset == 0 and progress.rejected > 0:
+                            _notice(
+                                on_notice,
+                                f"{plan.name}: {progress.rejected:,} rejection(s) happened before "
+                                "the dead-letter file existed and cannot be recovered; "
+                                "use --fresh for a complete file",
+                            )
+                    _notice(
+                        on_notice,
+                        f"{plan.name}: resuming; {progress.rows_read:,} root rows were already "
+                        "processed",
+                    )
+                elif dlq is not None:
+                    dlq.truncate(base)  # a fresh start: nothing of this collection is in the file
+
+                result = _copy_collection(
+                    source,
+                    mongo_collections[plan.name],
+                    plan,
+                    manifest.settings.batch_size,
+                    manifest.settings.on_row_error,
+                    store=store if checkpointing else None,
+                    fingerprint=fingerprint,
+                    after=after,
+                    progress=progress,
+                    resumed=resumed,
+                    on_batch=on_batch,
+                    dlq=dlq,
+                    pipeline=manifest.name,
+                )
+                if dlq is not None:
+                    base = dlq.size()
+
             results.append(result)
             if on_table_done is not None:
                 on_table_done(result)
@@ -315,62 +407,6 @@ def run_pipeline(
             store.close()
         if lock is not None:
             lock.release()
-
-
-def _notice(callback: Callable[[str], None] | None, message: str) -> None:
-    if callback is not None:
-        callback(message)
-
-
-def _run_collection(
-    source,
-    collection,
-    plan: CollectionPlan,
-    manifest: Manifest,
-    store: CheckpointStore | None,
-    state,
-    on_notice: Callable[[str], None] | None,
-    on_batch: Callable[[str, str, int], None] | None,
-) -> TableResult:
-    """Decide how one collection starts (fresh, resumed or skipped), then copy it."""
-    checkpointing = store is not None and plan.resume_problem is None
-    fingerprint = collection_fingerprint(manifest, plan) if checkpointing else ""
-    after: Cursor | None = None
-    progress = Progress()
-    resumed = False
-
-    if checkpointing and state is not None:
-        if state.fingerprint != fingerprint:
-            store.discard(plan.name)
-            _notice(
-                on_notice,
-                f"{plan.name}: the configuration or the source schema changed since the "
-                "interrupted run; this collection restarts from the beginning",
-            )
-        elif state.status == "done":
-            _notice(on_notice, f"{plan.name}: already completed by the interrupted run; skipped")
-            return _result_from_progress(plan, state.progress)
-        else:
-            after, progress, resumed = state.cursor, state.progress, True
-            _notice(
-                on_notice,
-                f"{plan.name}: resuming; {progress.rows_read:,} root rows were already "
-                "processed",
-            )
-
-    return _copy_collection(
-        source,
-        collection,
-        plan,
-        manifest.settings.batch_size,
-        manifest.settings.on_row_error,
-        store=store if checkpointing else None,
-        fingerprint=fingerprint,
-        after=after,
-        progress=progress,
-        resumed=resumed,
-        on_batch=on_batch,
-    )
 
 
 def _discover_tables(url: str) -> list[str]:
@@ -723,25 +759,52 @@ def _row_key(plan: TablePlan, row: Mapping[str, Any]) -> str:
     return ", ".join(f"{name}={row[name]!r}" for name in plan.pk_names)
 
 
-def _translate(plan: TablePlan, raw: Mapping[str, Any]) -> dict[str, Any]:
-    try:
-        return plan.translator.translate_row(raw)
-    except TranslationError as exc:
-        # A type error means the data does not match its schema: always fatal.
-        raise PipelineError(f"{exc} (row {_row_key(plan, raw)})") from exc
+def _key_dict(plan: TablePlan, row: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: row[name] for name in plan.pk_names}
+
+
+def _rejected(
+    plan: TablePlan,
+    raw: Mapping[str, Any],
+    stage: str,
+    reason: str,
+    message: str | None = None,
+) -> RowOutcome:
+    """A rejected row: the user-facing message plus the structured detail for the DLQ."""
+    text = message or f"{plan.name}: {reason} (row {_row_key(plan, raw)})"
+    detail = Rejection(
+        stage=stage,
+        table=plan.name,
+        key=_key_dict(plan, raw),
+        reason=reason,
+        message=text,
+        row=dict(raw),
+    )
+    return RowOutcome(rejection=text, detail=detail)
+
+
+def _translation_rejected(plan: TablePlan, raw: Mapping[str, Any], exc: TranslationError) -> RowOutcome:
+    # A value that does not fit its column type is a poison record: rejected like any
+    # other bad row (the run stops only under on_row_error: fail).
+    return _rejected(plan, raw, "translate", str(exc), message=f"{exc} (row {_row_key(plan, raw)})")
 
 
 def _apply_rules(plan: TablePlan, translated: dict[str, Any], raw: Mapping[str, Any]) -> RowOutcome:
     try:
         kept = plan.transform.apply(translated)
     except RowRejected as exc:
-        return RowOutcome(rejection=f"{plan.name}: {exc} (row {_row_key(plan, raw)})")
+        return _rejected(plan, raw, "transform", str(exc))
     return RowOutcome(document=kept)  # None means a filter dropped the row
 
 
 def process_row(plan: TablePlan, row: Mapping[str, Any]) -> RowOutcome:
     """Translate types, apply the transform rules and build the document for one flat row."""
-    outcome = _apply_rules(plan, _translate(plan, row), row)
+    try:
+        translated = plan.translator.translate_row(row)
+    except TranslationError as exc:
+        return _translation_rejected(plan, row, exc)
+
+    outcome = _apply_rules(plan, translated, row)
     if outcome.document is None:
         return outcome
     return RowOutcome(document=build_document(outcome.document, plan.pk_names))
@@ -761,12 +824,18 @@ def _process_node(
     if counter is not None:
         counter.read += 1
 
-    translated = _translate(plan, raw)
-    for name in removed:
-        translated.pop(name, None)
+    translated: dict[str, Any] | None = None
+    own_rejection: RowOutcome | None = None
+    try:
+        translated = plan.translator.translate_row(raw)
+    except TranslationError as exc:
+        own_rejection = _translation_rejected(plan, raw, exc)
+    else:
+        for name in removed:
+            translated.pop(name, None)
 
-    relation_rejection: str | None = None
-    descendant_rejection: str | None = None
+    relation_rejection: RowOutcome | None = None
+    descendant: RowOutcome | None = None
     for embed in embeds:
         children = _children_of(raw, embed, groups)
         built: list[dict[str, Any]] = []
@@ -776,27 +845,32 @@ def _process_node(
                 embed.label,
             )
             if outcome.rejection is not None:
-                descendant_rejection = descendant_rejection or outcome.rejection
+                descendant = descendant or outcome
             elif outcome.document is not None:
                 built.append(outcome.document)
 
+        value: Any
         if embed.relation is Relation.ONE:
             if len(children) > 1 and relation_rejection is None:
-                relation_rejection = (
-                    f"{plan.name}: expected at most one {embed.table.name} row for "
-                    f"'{embed.alias}' but found {len(children)} (row {_row_key(plan, raw)})"
+                reason = (
+                    f"expected at most one {embed.table.name} row for "
+                    f"'{embed.alias}' but found {len(children)}"
                 )
-            translated[embed.alias] = built[0] if built else None
+                relation_rejection = _rejected(plan, raw, "relation", reason)
+            value = built[0] if built else None
         else:
-            translated[embed.alias] = built
+            value = built
+        if translated is not None:
+            translated[embed.alias] = value
 
-    if relation_rejection is not None:
+    own = own_rejection or relation_rejection
+    if own is not None:
         if counter is not None:
             counter.rejected += 1
-        return RowOutcome(rejection=relation_rejection)
-    if descendant_rejection is not None:
+        return own
+    if descendant is not None:
         # The cause was already counted where it happened.
-        return RowOutcome(rejection=descendant_rejection, propagated=True)
+        return RowOutcome(rejection=descendant.rejection, propagated=True, detail=descendant.detail)
 
     outcome = _apply_rules(plan, translated, raw)
     if counter is not None:
@@ -834,19 +908,25 @@ def process_document(
     if outcome.rejection is not None:
         if outcome.propagated:
             suffix = f"; document rejected: {plan.root.name} {_row_key(plan.root, raw)}"
-            return RowOutcome(rejection=outcome.rejection + suffix)
-        return RowOutcome(rejection=outcome.rejection)
+            message = outcome.rejection + suffix
+            detail = (
+                replace(outcome.detail, message=message)
+                if outcome.detail is not None
+                else None
+            )
+            return RowOutcome(rejection=message, detail=detail)
+        return outcome
     if outcome.document is None:
         return outcome  # a filter dropped the root row
 
     document = build_document(outcome.document, plan.root.pk_names)
     problem = _document_problem(document)
     if problem is not None:
-        return RowOutcome(rejection=f"{plan.root.name}: {problem} (row {_row_key(plan.root, raw)})")
+        return _rejected(plan.root, raw, "document", problem)
     return RowOutcome(document=document)
 
 
-# --- copying one collection, with checkpoints --------------------------------------------------
+# --- copying one collection, with checkpoints and dead letters ----------------------------------
 
 
 def _embedded_results(
@@ -905,6 +985,25 @@ def _snapshot(
     )
 
 
+def _dead_letter(
+    dlq: DeadLetterWriter,
+    pipeline: str,
+    plan: CollectionPlan,
+    row: Mapping[str, Any],
+    outcome: RowOutcome,
+) -> str | None:
+    if outcome.detail is None:
+        return None
+    return format_entry(
+        pipeline,
+        plan.name,
+        plan.root.name,
+        _key_dict(plan.root, row),
+        outcome.detail,
+        include_row=dlq.include_rows,
+    )
+
+
 def _copy_collection(
     source,
     collection,
@@ -918,6 +1017,8 @@ def _copy_collection(
     progress: Progress | None = None,
     resumed: bool = False,
     on_batch: Callable[[str, str, int], None] | None = None,
+    dlq: DeadLetterWriter | None = None,
+    pipeline: str = "",
 ) -> TableResult:
     started = time.perf_counter()
     progress = progress or Progress()
@@ -938,10 +1039,14 @@ def _copy_collection(
         prefetch_children(source, plan.embeds, batch.rows, groups)
 
         documents = []
+        dead_letters: list[str] = []
         for row in batch.rows:
             outcome = process_document(plan, row, groups, counters)
             if outcome.rejection is not None:
+                entry = _dead_letter(dlq, pipeline, plan, row, outcome) if dlq is not None else None
                 if on_row_error is RowErrorPolicy.FAIL:
+                    if dlq is not None and entry is not None:
+                        dlq.append([entry])  # the row that stops the run is recorded too
                     raise PipelineError(
                         f"{outcome.rejection}. Set settings.on_row_error: skip "
                         "to continue past rejected rows."
@@ -949,6 +1054,8 @@ def _copy_collection(
                 rejected += 1
                 if len(samples) < MAX_REJECTION_SAMPLES:
                     samples.append(outcome.rejection)
+                if entry is not None:
+                    dead_letters.append(entry)
             elif outcome.document is None:
                 filtered += 1
             else:
@@ -959,15 +1066,20 @@ def _copy_collection(
         stats += write_documents(collection, documents)
         rows_read += len(batch.rows)
 
-        if on_batch is not None:
-            on_batch("written", plan.name, batch_number)  # data is in MongoDB, checkpoint is not
+        # Order: documents, then dead letters (fsync), then the checkpoint. A crash at any
+        # point repeats at most this batch; resume cuts the dead-letter file back to the
+        # offset saved in the checkpoint, so its entries are written exactly once.
+        if dlq is not None:
+            dlq.append(dead_letters)
 
-        # Write first, checkpoint second: a crash between the two repeats this
-        # batch on resume, which is harmless because the writes are idempotent.
+        if on_batch is not None:
+            on_batch("written", plan.name, batch_number)
+
         if store is not None:
             store.save_progress(
                 plan.name, fingerprint, batch.cursor,
                 _snapshot(rows_read, filtered, rejected, stats, counters),
+                dlq_offset=dlq.size() if dlq is not None else 0,
             )
 
         if on_batch is not None:
@@ -975,7 +1087,9 @@ def _copy_collection(
 
     final = _snapshot(rows_read, filtered, rejected, stats, counters)
     if store is not None:
-        store.mark_done(plan.name, fingerprint, final)
+        store.mark_done(
+            plan.name, fingerprint, final, dlq_offset=dlq.size() if dlq is not None else 0
+        )
 
     return TableResult(
         table=plan.name,
