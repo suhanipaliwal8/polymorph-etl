@@ -135,3 +135,8 @@ def mongo_target():
     finally:
         client.drop_database(name)
         client.close()
+
+@pytest.fixture(autouse=True)
+def isolated_working_directory(tmp_path, monkeypatch):
+    """Run every test in its own empty folder, so state files never touch the repository."""
+    monkeypatch.chdir(tmp_path)

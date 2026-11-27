@@ -263,3 +263,45 @@ If the database matches a child to a parent but Python's key comparison does
 not (case-insensitive collation, padded text), the run stops instead of
 dropping the row. Counters are kept per embedded table, so source rows can be
 reconciled against documents.
+
+## 46. Write first, checkpoint second
+Each batch is written to MongoDB and only then checkpointed. A crash between
+the two repeats one batch on resume; idempotent upserts make that harmless
+(at-least-once delivery plus idempotency gives an effectively-once result).
+The reverse order could silently lose a batch.
+
+## 47. The checkpoint is a SQLite file with atomic transactions
+The cursor and the cumulative counters are saved in one transaction, so they
+can never disagree and a crash leaves the old or the new state, never a mix.
+Standard-library `sqlite3`, one file per pipeline, no new dependency.
+
+## 48. Only interrupted runs leave a checkpoint
+A completed run clears its state, so the next run is a full idempotent pass,
+which keeps the earlier repair-by-rerun behaviour. Resuming skips collections
+that already finished and continues the unfinished one.
+
+## 49. Fingerprints guard against stale progress
+Each collection's checkpoint carries a hash of everything that shapes its
+documents: structure, transforms (salts only as digests), type overrides,
+time zone, the source schema, and the host and database (never credentials)
+of source and target. `batch_size` and `on_row_error` are excluded. A mismatch
+restarts that collection, which is always safe.
+
+## 50. Counters are checkpointed with the cursor
+Without them a resumed run would lose the rejections that happened before the
+crash and report the wrong exit code. Counters are cumulative, so the
+accounting identity still holds.
+
+## 51. Typed JSON cursors, never pickle
+Cursor values are stored with a type tag so UUIDs, decimals and datetimes
+come back exactly. Unpickling a file can execute code. Key types that cannot
+be saved are detected at planning time; that collection runs without resume.
+
+## 52. An OS file lock instead of a PID file
+The lock is released by the operating system when the process dies, even after
+SIGKILL, so a crash never leaves a stale lock.
+
+## 53. Fault injection is part of the tool
+A hidden `--crash-at STAGE:N` ends the process with `os._exit(137)` without
+any cleanup. It makes crash recovery testable and demonstrable (a real
+subprocess test, and the Phase 14 demo).

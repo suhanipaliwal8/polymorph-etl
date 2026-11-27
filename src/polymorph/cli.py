@@ -1,6 +1,7 @@
 """Command-line interface for PolyMorph ETL."""
 
 import json
+import os
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -8,6 +9,7 @@ import typer
 from bson import json_util
 
 from polymorph import __version__
+from polymorph.checkpoint import CheckpointError, CheckpointStore, checkpoint_path
 from polymorph.draft import render_manifest_draft
 from polymorph.extractor import ExtractError, extract_batches
 from polymorph.inspector import (
@@ -33,6 +35,8 @@ from polymorph.pipeline import (
 
 PREVIEW_SCAN_LIMIT = 10_000
 EXIT_ROWS_REJECTED = 3
+EXIT_CRASH_INJECTED = 137
+DEFAULT_STATE_DIR = Path(".polymorph")
 
 app = typer.Typer(
     name="polymorph",
@@ -52,6 +56,35 @@ def _show_version(value: bool) -> None:
     if value:
         typer.echo(f"polymorph {__version__}")
         raise typer.Exit()
+
+
+def _crash_hook(spec: str):
+    """Fault injection for crash-recovery tests and demos: STAGE:N, e.g. written:3.
+
+    The process ends immediately and without any cleanup, like `kill -9`.
+    """
+    stage, _, number = spec.partition(":")
+    if stage not in ("written", "checkpointed") or not number.isdigit() or int(number) < 1:
+        raise typer.BadParameter(
+            "use STAGE:N with STAGE written or checkpointed and N >= 1, e.g. written:3",
+            param_hint="--crash-at",
+        )
+    target = int(number)
+    seen = 0
+
+    def hook(event_stage: str, collection: str, batch_number: int) -> None:
+        nonlocal seen
+        if event_stage != stage:
+            return
+        seen += 1
+        if seen == target:
+            typer.echo(
+                f"-- simulated crash at {stage}:{target} ({collection} batch {batch_number})",
+                err=True,
+            )
+            os._exit(EXIT_CRASH_INJECTED)
+
+    return hook
 
 
 @app.callback()
@@ -295,8 +328,38 @@ def run(
     manifest_path: Annotated[
         Path, typer.Argument(help="Path to the pipeline YAML manifest.")
     ],
+    state_dir: Annotated[
+        Path,
+        typer.Option("--state-dir", help="Folder for checkpoint files."),
+    ] = DEFAULT_STATE_DIR,
+    fresh: Annotated[
+        bool,
+        typer.Option("--fresh", help="Discard saved progress and start from the beginning."),
+    ] = False,
+    no_checkpoint: Annotated[
+        bool,
+        typer.Option("--no-checkpoint", help="Do not save or use checkpoints."),
+    ] = False,
+    crash_at: Annotated[
+        Optional[str],
+        typer.Option(
+            "--crash-at",
+            hidden=True,
+            help="Fault injection: end the process at STAGE:N (written:3 or checkpointed:3).",
+        ),
+    ] = None,
 ) -> None:
-    """Run a pipeline: read the source in batches and load it into the target."""
+    """Run a pipeline: read the source in batches and load it into the target.
+
+    Progress is checkpointed after every batch. If the run is interrupted,
+    running the same command again resumes from the last checkpoint.
+    """
+    if fresh and no_checkpoint:
+        raise typer.BadParameter(
+            "--fresh and --no-checkpoint cannot be combined", param_hint="--fresh"
+        )
+    crash_hook = _crash_hook(crash_at) if crash_at is not None else None
+
     try:
         manifest = load_manifest(manifest_path)
     except ManifestError as exc:
@@ -307,7 +370,9 @@ def run(
         f"{url_scheme(manifest.target.url)} ({manifest.mode.value})"
     )
 
+    checkpoint_dir = None if no_checkpoint else state_dir
     header_printed = False
+    notices_printed = False
 
     def show_plan(notes) -> None:
         if notes:
@@ -316,6 +381,14 @@ def run(
             for note in notes:
                 typer.echo(f"  - {note}")
 
+    def show_notice(message: str) -> None:
+        nonlocal notices_printed
+        if not notices_printed:
+            typer.echo("")
+            typer.echo("Checkpoint:")
+            notices_printed = True
+        typer.echo(f"  - {message}")
+
     def show_table(result) -> None:
         nonlocal header_printed
         if not header_printed:
@@ -323,6 +396,10 @@ def run(
             typer.echo(TABLE_HEADER)
             header_printed = True
         typer.echo(format_table_row(result))
+        if result.skipped:
+            typer.echo("  (finished by the interrupted run; not run again)")
+        elif result.resumed:
+            typer.echo("  (resumed from a checkpoint; counts include the earlier part)")
         for embedded in result.embedded:
             typer.echo(format_embedded_row(embedded))
         if result.rejected:
@@ -332,14 +409,29 @@ def run(
                 typer.echo(f"      - {sample}")
 
     try:
-        summary = run_pipeline(manifest, on_plan=show_plan, on_table_done=show_table)
-    except (PipelineError, InspectError, ExtractError, LoadError) as exc:
-        if header_printed:
-            typer.echo(
-                "\nSome collections were already written. Re-running the same command "
-                "is safe: writes are idempotent.",
-                err=True,
-            )
+        summary = run_pipeline(
+            manifest,
+            on_plan=show_plan,
+            on_table_done=show_table,
+            state_dir=checkpoint_dir,
+            fresh=fresh,
+            on_notice=show_notice,
+            on_batch=crash_hook,
+        )
+    except (PipelineError, InspectError, ExtractError, LoadError, CheckpointError) as exc:
+        if not isinstance(exc, CheckpointError):
+            if checkpoint_dir is not None:
+                typer.echo(
+                    "\nSaved progress is kept. Re-run the same command to resume from the "
+                    "last checkpoint (add --fresh to start over).",
+                    err=True,
+                )
+            elif header_printed:
+                typer.echo(
+                    "\nSome collections were already written. Re-running the same command "
+                    "is safe: writes are idempotent.",
+                    err=True,
+                )
         raise _fail(str(exc)) from exc
 
     typer.echo("")
@@ -355,3 +447,47 @@ def run(
             err=True,
         )
         raise typer.Exit(code=EXIT_ROWS_REJECTED)
+
+
+@app.command()
+def status(
+    manifest_path: Annotated[
+        Path, typer.Argument(help="Path to the pipeline YAML manifest.")
+    ],
+    state_dir: Annotated[
+        Path,
+        typer.Option("--state-dir", help="Folder for checkpoint files."),
+    ] = DEFAULT_STATE_DIR,
+) -> None:
+    """Show the saved progress of an interrupted run."""
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        raise _fail(str(exc)) from exc
+
+    none_saved = (
+        f"Pipeline '{manifest.name}': no saved progress. The next run starts from the beginning."
+    )
+    path = checkpoint_path(state_dir, manifest.name)
+    if not path.exists():
+        typer.echo(none_saved)
+        return
+
+    try:
+        with CheckpointStore(path) as store:
+            states = store.load()
+    except CheckpointError as exc:
+        raise _fail(str(exc)) from exc
+
+    if not states:
+        typer.echo(none_saved)
+        return
+
+    typer.echo(f"Pipeline '{manifest.name}': saved progress of an interrupted run")
+    typer.echo("")
+    typer.echo(f"{'COLLECTION':<26}{'STATUS':<14}{'ROWS DONE':>10}   LAST UPDATE (UTC)")
+    for name, state in sorted(states.items()):
+        label = "completed" if state.status == "done" else "in progress"
+        typer.echo(f"{name:<26}{label:<14}{state.progress.rows_read:>10,}   {state.updated_at}")
+    typer.echo("")
+    typer.echo("Re-run the same command to resume, or add --fresh to start over.")
