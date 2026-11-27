@@ -32,7 +32,7 @@ crash-safe precision.
 - [x] Phase 7: Transform engine
 - [x] Phase 8: Join folding
 - [x] Phase 9: Checkpointing and crash resume
-- [ ] Phase 10: Dead-letter queue
+- [x] Phase 10: Dead-letter queue
 - [ ] Phase 11: Concurrency
 - [ ] Phase 12: Verification audit, run reports and dry run
 - [ ] Phase 13: SQL-to-SQL for any supported database
@@ -273,6 +273,33 @@ fingerprint of the configuration and the source schema protects against
 resuming with stale progress, and an OS file lock keeps two runs of one
 pipeline apart. See [`docs/checkpointing.md`](docs/checkpointing.md), including
 how to inject a crash for testing.
+
+### Dead-letter queue
+
+Rows that cannot be migrated (an invalid email, a negative quantity, a value
+that does not fit its type) never stop a run under `on_row_error: skip`. Every
+rejected document is written to a JSON-lines file with the exact reason, and
+the run exits with code 3:
+
+```bash
+polymorph run examples/pipelines/postgres-to-mongo-folded.yaml
+polymorph dlq examples/pipelines/postgres-to-mongo-folded.yaml
+```
+
+```
+COLLECTION            STAGE      TABLE                COUNT  REASON
+customers             transform  order_items              1  quantity must be positive
+
+First 1:
+  customers id=17 <- order_items id=5 [transform]: quantity must be positive
+```
+
+Entries hold table names, primary keys and reasons, never row data (opt in
+with `dlq_include_rows`), so the file is safe to share and the source row is
+one `SELECT ... WHERE id = ...` away. Fix the source, re-run, and the file is
+empty again. The file is crash-safe: its size is saved with every checkpoint
+and cut back on resume, so entries are never duplicated or lost. See
+[`docs/dead-letter-queue.md`](docs/dead-letter-queue.md).
 
 ## Continuous integration
 

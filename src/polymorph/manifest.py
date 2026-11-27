@@ -85,6 +85,7 @@ class Settings(BaseModel):
     batch_size: int = Field(default=1000, ge=1, le=100_000)
     naive_timestamp_timezone: str = "UTC"
     on_row_error: RowErrorPolicy = RowErrorPolicy.FAIL
+    dlq_include_rows: bool = False
 
     @field_validator("naive_timestamp_timezone")
     @classmethod

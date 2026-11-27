@@ -11,7 +11,8 @@
 | `tables` | no (all) | Tables to migrate, parents before children (foreign-key order). Must be non-empty and unique. |
 | `settings.naive_timestamp_timezone` | no (`UTC`) | IANA zone (e.g. `Asia/Kolkata`) used to read timestamps that carry no time zone. They are stored as UTC. |
 | `type_overrides` | no | Map of `table.column` to `uuid`, `boolean` or `string`; see `type-translation.md`. |
-| `settings.on_row_error` | no (`fail`) | `fail` stops at the first rejected row; `skip` counts rejected rows, loads the rest and exits with code 3. |
+| `settings.on_row_error` | no (`fail`) | `fail` stops at the first rejected row; `skip` counts rejected rows, loads the rest and exits with code 3. Rejected documents go to the dead-letter file. |
+| `settings.dlq_include_rows` | no (`false`) | Also write the raw source row of the failing row into each dead-letter entry. It can contain personal data that the rules would mask. |
 | `transforms` | no | Map of table name to a list of rules (`rename`, `drop`, `normalize`, `mask`, `hash`, `compute`, `filter`, `require`). See `transforms.md`. |
 | `tables` | no | Tables copied flat (one collection per table), parents before children. Omit both `tables` and `collections` to copy every table. With `collections` present, omit `tables` to migrate only the collections. |
 | `collections` | no | Folded collections: a root table with embedded child tables (`one` / `many`). See `folding.md`. |

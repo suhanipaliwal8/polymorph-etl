@@ -11,6 +11,7 @@ from bson import json_util
 from polymorph import __version__
 from polymorph.checkpoint import CheckpointError, CheckpointStore, checkpoint_path
 from polymorph.draft import render_manifest_draft
+from polymorph.dlq import DeadLetterError, dead_letter_path, describe_entry, summarize
 from polymorph.extractor import ExtractError, extract_batches
 from polymorph.inspector import (
     InspectError,
@@ -330,7 +331,7 @@ def run(
     ],
     state_dir: Annotated[
         Path,
-        typer.Option("--state-dir", help="Folder for checkpoint files."),
+        typer.Option("--state-dir", help="Folder for checkpoint and dead-letter files."),
     ] = DEFAULT_STATE_DIR,
     fresh: Annotated[
         bool,
@@ -340,6 +341,14 @@ def run(
         bool,
         typer.Option("--no-checkpoint", help="Do not save or use checkpoints."),
     ] = False,
+    dlq_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--dlq-file",
+            help="Where to record rejected documents "
+            "(default: <state-dir>/<pipeline>.dlq_errors.jsonl).",
+        ),
+    ] = None,
     crash_at: Annotated[
         Optional[str],
         typer.Option(
@@ -352,7 +361,8 @@ def run(
     """Run a pipeline: read the source in batches and load it into the target.
 
     Progress is checkpointed after every batch. If the run is interrupted,
-    running the same command again resumes from the last checkpoint.
+    running the same command again resumes from the last checkpoint. Rejected
+    documents are recorded in a dead-letter file.
     """
     if fresh and no_checkpoint:
         raise typer.BadParameter(
@@ -371,6 +381,7 @@ def run(
     )
 
     checkpoint_dir = None if no_checkpoint else state_dir
+    dead_letters = dlq_file or dead_letter_path(state_dir, manifest.name)
     header_printed = False
     notices_printed = False
 
@@ -417,9 +428,12 @@ def run(
             fresh=fresh,
             on_notice=show_notice,
             on_batch=crash_hook,
+            dlq_path=dead_letters,
         )
-    except (PipelineError, InspectError, ExtractError, LoadError, CheckpointError) as exc:
-        if not isinstance(exc, CheckpointError):
+    except (
+        PipelineError, InspectError, ExtractError, LoadError, CheckpointError, DeadLetterError
+    ) as exc:
+        if not isinstance(exc, (CheckpointError, DeadLetterError)):
             if checkpoint_dir is not None:
                 typer.echo(
                     "\nSaved progress is kept. Re-run the same command to resume from the "
@@ -432,6 +446,8 @@ def run(
                     "is safe: writes are idempotent.",
                     err=True,
                 )
+            if dead_letters.exists() and dead_letters.stat().st_size > 0:
+                typer.echo(f"The rejected row is recorded in {dead_letters}", err=True)
         raise _fail(str(exc)) from exc
 
     typer.echo("")
@@ -439,14 +455,20 @@ def run(
     typer.secho(format_footer(summary), fg=color)
 
     if summary.rejected:
+        plural = "entry" if summary.rejected == 1 else "entries"
+        typer.echo(f"Dead-letter file: {dead_letters} ({summary.rejected:,} {plural})")
+        typer.echo(f"Inspect it with: polymorph dlq {manifest_path} --file {dead_letters}")
         typer.secho(
             f"{summary.rejected:,} document(s)/row(s) were rejected and skipped "
-            "(settings.on_row_error: skip). Only the first reasons per collection are listed "
-            "above; the dead-letter queue (Phase 10) will record every one.",
+            "(settings.on_row_error: skip). Every one is recorded in the dead-letter file.",
             fg=typer.colors.YELLOW,
             err=True,
         )
         raise typer.Exit(code=EXIT_ROWS_REJECTED)
+
+
+def _entries_text(count: int) -> str:
+    return f"{count:,} {'entry' if count == 1 else 'entries'}"
 
 
 @app.command()
@@ -456,14 +478,23 @@ def status(
     ],
     state_dir: Annotated[
         Path,
-        typer.Option("--state-dir", help="Folder for checkpoint files."),
+        typer.Option("--state-dir", help="Folder for checkpoint and dead-letter files."),
     ] = DEFAULT_STATE_DIR,
 ) -> None:
-    """Show the saved progress of an interrupted run."""
+    """Show the saved progress of an interrupted run and the dead-letter file."""
     try:
         manifest = load_manifest(manifest_path)
     except ManifestError as exc:
         raise _fail(str(exc)) from exc
+
+    def show_dead_letters() -> None:
+        path = dead_letter_path(state_dir, manifest.name)
+        if path.exists():
+            try:
+                count = summarize(path, 0).entries
+            except DeadLetterError as exc:
+                raise _fail(str(exc)) from exc
+            typer.echo(f"Dead-letter file: {path} ({_entries_text(count)})")
 
     none_saved = (
         f"Pipeline '{manifest.name}': no saved progress. The next run starts from the beginning."
@@ -471,6 +502,7 @@ def status(
     path = checkpoint_path(state_dir, manifest.name)
     if not path.exists():
         typer.echo(none_saved)
+        show_dead_letters()
         return
 
     try:
@@ -481,6 +513,7 @@ def status(
 
     if not states:
         typer.echo(none_saved)
+        show_dead_letters()
         return
 
     typer.echo(f"Pipeline '{manifest.name}': saved progress of an interrupted run")
@@ -490,4 +523,58 @@ def status(
         label = "completed" if state.status == "done" else "in progress"
         typer.echo(f"{name:<26}{label:<14}{state.progress.rows_read:>10,}   {state.updated_at}")
     typer.echo("")
+    show_dead_letters()
     typer.echo("Re-run the same command to resume, or add --fresh to start over.")
+
+
+@app.command("dlq")
+def dlq_command(
+    manifest_path: Annotated[
+        Path, typer.Argument(help="Path to the pipeline YAML manifest.")
+    ],
+    state_dir: Annotated[
+        Path,
+        typer.Option("--state-dir", help="Folder for checkpoint and dead-letter files."),
+    ] = DEFAULT_STATE_DIR,
+    file: Annotated[
+        Optional[Path],
+        typer.Option("--file", help="Read this dead-letter file instead of the default one."),
+    ] = None,
+    limit: Annotated[
+        int, typer.Option("--limit", min=0, help="How many entries to show in full.")
+    ] = 5,
+) -> None:
+    """Summarise the dead-letter file: which documents were rejected, and why."""
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        raise _fail(str(exc)) from exc
+
+    path = file or dead_letter_path(state_dir, manifest.name)
+    if not path.exists():
+        raise _fail(f"No dead-letter file at {path}. `polymorph run` creates it.")
+
+    try:
+        summary = summarize(path, limit)
+    except DeadLetterError as exc:
+        raise _fail(str(exc)) from exc
+
+    typer.echo(f"Dead-letter file: {path}")
+    if summary.entries == 0 and summary.unreadable == 0:
+        typer.echo("No rejected rows.")
+        return
+
+    line = _entries_text(summary.entries)
+    if summary.unreadable:
+        line += f", {summary.unreadable} unreadable line(s)"
+    typer.echo(line)
+    typer.echo("")
+    typer.echo(f"{'COLLECTION':<22}{'STAGE':<11}{'TABLE':<20}{'COUNT':>6}  REASON")
+    for (collection, stage, table, reason), count in summary.groups:
+        typer.echo(f"{collection:<22}{stage:<11}{table:<20}{count:>6}  {reason}")
+
+    if summary.first:
+        typer.echo("")
+        typer.echo(f"First {len(summary.first)}:")
+        for entry in summary.first:
+            typer.echo(f"  {describe_entry(entry)}")

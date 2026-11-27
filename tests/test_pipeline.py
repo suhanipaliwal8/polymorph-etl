@@ -167,3 +167,36 @@ def test_filtered_rows_are_dropped_without_being_rejected(shop_url, make_manifes
     assert dropped
     assert all(outcome.rejection is None for outcome in dropped)
     assert len(dropped) == sum(1 for row in rows.values() if row["loyalty_tier"] == "bronze")
+
+def test_rejections_carry_structured_details(customer_plan):
+    plan, rows = customer_plan
+
+    detail = process_row(plan, rows[13]).detail
+
+    assert (detail.stage, detail.table, detail.key) == ("transform", "customers", {"id": 13})
+    assert detail.reason == "email: not a valid email address"
+    assert detail.row["email"] == "not-an-email"  # kept in memory; written only on request
+
+
+def test_a_type_error_is_a_rejection_not_an_exception(tmp_path, make_manifest):
+    url = make_sqlite(
+        tmp_path,
+        "typeless.db",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+        "INSERT INTO items VALUES (1, 5), (2, 'abc')",
+    )
+    engine = create_source_engine(url)
+    try:
+        plan = plan_table(engine, "items", make_manifest(url))
+    finally:
+        engine.dispose()
+    rows = load_rows(url, "items")
+
+    good = process_row(plan, rows[1])
+    bad = process_row(plan, rows[2])
+
+    assert good.document == {"_id": 1, "qty": 5}
+    assert bad.document is None
+    assert bad.detail.stage == "translate"
+    assert "items.qty" in bad.detail.reason
+    assert "abc" not in bad.rejection

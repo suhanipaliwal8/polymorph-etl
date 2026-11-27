@@ -26,3 +26,5 @@ dlq_errors.jsonl
 
 # Checkpoint state
 /.polymorph/
+
+*.dlq_errors.jsonl

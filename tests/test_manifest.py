@@ -290,3 +290,11 @@ def test_transforms_must_target_tables_used_by_collections(tmp_path):
     content = VALID + FOLDED + "transforms:\n  ghost:\n    - type: drop\n      fields: [x]\n"
     with pytest.raises(ManifestError, match="not listed"):
         load_manifest(write_manifest(tmp_path, content), env=ENV)
+
+def test_dlq_include_rows_defaults_to_off_and_can_be_enabled(tmp_path):
+    default = load_manifest(write_manifest(tmp_path), env=ENV)
+    assert default.settings.dlq_include_rows is False
+
+    content = VALID + "settings:\n  dlq_include_rows: true\n"
+    enabled = load_manifest(write_manifest(tmp_path, content), env=ENV)
+    assert enabled.settings.dlq_include_rows is True

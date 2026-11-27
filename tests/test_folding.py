@@ -271,6 +271,7 @@ def test_a_one_to_one_relation_with_two_matching_rows_rejects_the_parent(tmp_pat
     assert "expected at most one" in outcomes[1].rejection
     assert outcomes[2].document["badge"] == {"id": 3, "label": "z"}
     assert any("not enforced" in note for note in plan.notes)
+    assert outcomes[1].detail.stage == "relation"
 
 
 def test_composite_foreign_keys_are_joined_on_all_columns(tmp_path, make_manifest):
@@ -375,3 +376,24 @@ def test_children_that_python_cannot_match_are_reported_not_lost(tmp_path, make_
     # The database matches 'abc' to 'ABC' (case-insensitive); Python does not.
     with pytest.raises(PipelineError, match="could not be matched|not in Python"):
         fold(url, make_manifest(url, collections=collections), collection="parents")
+
+def test_the_cause_of_a_rejected_document_has_its_own_table_and_key(
+    shop_url, make_manifest, folding_spec
+):
+    transforms = {
+        "order_items": [
+            {"type": "require", "expression": "quantity > 0", "message": "quantity must be positive"}
+        ]
+    }
+    _, outcomes, _ = fold(
+        shop_url, make_manifest(shop_url, collections=folding_spec, transforms=transforms)
+    )
+    owner = scalar(
+        shop_url,
+        "SELECT o.customer_id FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = 5",
+    )
+
+    detail = outcomes[owner].detail
+
+    assert (detail.stage, detail.table, detail.key) == ("transform", "order_items", {"id": 5})
+    assert detail.reason == "quantity must be positive"

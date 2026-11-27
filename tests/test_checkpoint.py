@@ -186,3 +186,60 @@ def test_a_held_lock_refuses_a_second_holder_and_is_free_after_release(tmp_path)
 
     with RunLock(path):  # free again
         pass
+
+def test_the_dead_letter_offset_is_saved_with_the_progress(tmp_path):
+    path = tmp_path / "p.sqlite"
+    with CheckpointStore(path) as store:
+        store.save_progress("a", "fp", (1,), Progress(), dlq_offset=120)
+        store.mark_done("b", "fp", Progress(), dlq_offset=300)
+        store.save_progress("c", "fp", (1,), Progress())
+    with CheckpointStore(path) as store:
+        states = store.load()
+
+    assert states["a"].dlq_offset == 120
+    assert states["b"].dlq_offset == 300
+    assert states["c"].dlq_offset == 0
+
+
+def test_a_version_1_file_is_migrated_and_keeps_its_progress(tmp_path):
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE collections (name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+        "status TEXT NOT NULL CHECK (status IN ('in_progress', 'done')), cursor TEXT, "
+        "progress TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO collections VALUES ('customers', 'fp', 'in_progress', ?, ?, '2026-01-01 00:00:00')",
+        ('[["int", "14"]]', Progress(rows_read=14).to_json()),
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+    with CheckpointStore(path) as store:
+        state = store.load()["customers"]
+        assert state.cursor == (14,)
+        assert state.progress.rows_read == 14
+        assert state.dlq_offset == 0
+        store.save_progress("customers", "fp", (21,), Progress(rows_read=21), dlq_offset=55)
+        assert store.load()["customers"].dlq_offset == 55
+
+    with CheckpointStore(path) as store:  # opening a migrated file again is fine
+        assert store.load()["customers"].cursor == (21,)
+
+
+def test_an_interrupted_migration_can_be_finished(tmp_path):
+    path = tmp_path / "half.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE collections (name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+        "status TEXT NOT NULL CHECK (status IN ('in_progress', 'done')), cursor TEXT, "
+        "progress TEXT NOT NULL, updated_at TEXT NOT NULL, dlq_offset INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute("PRAGMA user_version = 1")  # column added, version not yet bumped
+    conn.commit()
+    conn.close()
+
+    with CheckpointStore(path) as store:
+        assert store.load() == {}
