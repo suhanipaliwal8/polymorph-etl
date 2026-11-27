@@ -305,3 +305,41 @@ SIGKILL, so a crash never leaves a stale lock.
 A hidden `--crash-at STAGE:N` ends the process with `os._exit(137)` without
 any cleanup. It makes crash recovery testable and demonstrable (a real
 subprocess test, and the Phase 14 demo).
+
+
+## 54. Rejected documents go to a dead-letter file, not just a counter
+Each entry names the rejected document (root table and key) and the cause (the
+failing row, which can be an embedded one, its stage and reason). Entries
+never contain row data unless `dlq_include_rows` is set, because raw rows hold
+unmasked personal data; keys are enough to find the row in the source. Entries
+are pure ASCII so poison data can never make writing the file fail.
+
+## 55. Type errors are poison records too
+A value that does not fit its column type (a number beyond 64 bits, more than
+34 decimal digits) is a data problem, not a schema problem. Under
+`on_row_error: skip` it is rejected and dead-lettered instead of stopping a
+large migration; under `fail` the run still stops, now after recording the row.
+
+## 56. Exactly-once dead letters through a write-ahead offset
+The size of the dead-letter file is saved in the checkpoint. After a crash the
+file is truncated to that size and the unfinished batch runs again, so its
+entries are written once. Order per batch: documents, dead letters with
+`fsync`, checkpoint. This keeps the file as a live, append-only artifact
+instead of an export of a database table, and works with and without
+checkpoints.
+
+## 57. Offsets form a chain across collections
+All collections share one file, so once a collection runs or restarts, the
+saved progress of the collections after it no longer fits the file and they
+restart too. That is always safe because writes are idempotent, and it avoids
+interleaving entries of different attempts.
+
+## 58. The file describes the latest run
+A new run starts with an empty file, so fixing the source and re-running
+leaves no stale entries. A missing or shortened file during a resume is
+refused (`--fresh`) rather than silently producing an incomplete record.
+
+## 59. Checkpoint format v2 with a repeatable migration
+`dlq_offset` was added with a migration that checks whether the column exists
+before adding it, because DDL is not transactional here and a crash half-way
+must leave a file the next start can finish.

@@ -2,8 +2,10 @@
 
 Each column is translated according to its **reflected SQL type**, chosen once
 per table. NULL stays `null`. A value that does not fit its column type is a
-translation error: the run stops with the table, column and primary key of the
-row (never the value itself, which may be personal data).
+translation error. The row is rejected with the table, column and primary key
+(never the value itself, which may be personal data): the run stops under
+`on_row_error: fail` (default) and continues, recording the row in the
+dead-letter file, under `skip`.
 
 ## Mapping
 
@@ -46,8 +48,8 @@ The table must be migrated and the column must exist; otherwise the run stops
 before writing anything.
 
 ## Translation errors vs business rules
-A text value in an integer column is a **type** problem and stops the run.
-`email = "not-an-email"` is valid text and passes. Rejecting or fixing such
+A text value in an integer column is a **type** problem: the row is rejected
+(stage `translate`). Rejecting or fixing such
 rows is the job of the transform engine (Phase 7) and the dead-letter queue
 (Phase 10).
 

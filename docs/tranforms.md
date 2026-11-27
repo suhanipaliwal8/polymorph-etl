@@ -57,8 +57,12 @@ Null values pass through `normalize`, `mask` and `hash` unchanged.
   - `on_row_error: skip`: rejected rows are counted and the first ten reasons
     per table are printed. The run ends with **exit code 3**. The dead-letter
     queue (Phase 10) will record every rejected row.
+  - `on_row_error: skip`: rejected rows are counted, the run continues, and
+    every rejected document is recorded in the dead-letter file with the
+    exact reason (see `dead-letter-queue.md`). The run ends with **exit code 3**.
 
-Type errors (for example text in an integer column) always stop the run.
+Type errors (for example text in an integer column) are rejections too: they stop
+the run under `on_row_error: fail` and are dead-lettered under `skip`.
 
 Every row is accounted for:
 `rows read = filtered + rejected + created + updated + unchanged`.

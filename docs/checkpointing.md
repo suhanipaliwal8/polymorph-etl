@@ -82,10 +82,26 @@ The exit code is 137. Batches are counted across the whole run.
 - Documents that a changed configuration would now filter or reject are not
   removed from MongoDB; the reconciliation report (Phase 12) will list them.
 - Resume granularity is one batch.
-- Rejected-row samples are only kept for the current attempt; the dead-letter
-  queue (Phase 10) will record every rejected row.
 - A finished collection is skipped on resume even if its source changed
   meanwhile; use `--fresh` to copy it again.
 - Primary keys of unsupported types (for example JSON) cannot be saved; the
   collection runs without resume and a note says so.
 - Checkpoints are written from a single thread; Phase 11 keeps it that way.
+
+
+## Dead letters and checkpoints
+The checkpoint also stores the size of the dead-letter file (`dlq_offset`,
+checkpoint format v2; format v1 files from Phase 9 are migrated automatically).
+The order of a batch is: documents to MongoDB, dead letters to the file with
+`fsync`, then the checkpoint. On resume the file is cut back to the saved
+offset, so the entries of a repeated batch are written once. See
+[`dead-letter-queue.md`](dead-letter-queue.md).
+
+Because all collections share one dead-letter file, resuming follows a chain:
+finished collections are skipped, the first unfinished one resumes, and every
+later collection starts from the beginning (it never ran, so nothing of it is
+in the file). A collection that restarts because its configuration changed
+also restarts the collections after it.
+
+The `written:N` crash point is now "documents are in MongoDB and the dead
+letters are in the file, but the checkpoint is not saved".
