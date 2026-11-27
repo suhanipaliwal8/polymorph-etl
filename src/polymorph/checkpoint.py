@@ -12,7 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 1: Phase 9. 2: adds dlq_offset (size of the dead-letter file)
 
 # The primary-key values of the last row seen, e.g. (500,) or (3, 12).
 Cursor = tuple[Any, ...]
@@ -166,19 +166,21 @@ CREATE TABLE IF NOT EXISTS collections (
     status      TEXT NOT NULL CHECK (status IN ('in_progress', 'done')),
     cursor      TEXT,
     progress    TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    dlq_offset  INTEGER NOT NULL DEFAULT 0
 )
 """
 
 _UPSERT = """
-INSERT INTO collections (name, fingerprint, status, cursor, progress, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO collections (name, fingerprint, status, cursor, progress, updated_at, dlq_offset)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
     fingerprint = excluded.fingerprint,
     status      = excluded.status,
     cursor      = excluded.cursor,
     progress    = excluded.progress,
-    updated_at  = excluded.updated_at
+    updated_at  = excluded.updated_at,
+    dlq_offset  = excluded.dlq_offset
 """
 
 
@@ -190,6 +192,7 @@ class CollectionState:
     cursor: Cursor | None
     progress: Progress
     updated_at: str
+    dlq_offset: int = 0  # size of the dead-letter file when this state was saved
 
 
 def _now() -> str:
@@ -223,6 +226,10 @@ class CheckpointStore:
                 f"Checkpoint file {path} is unreadable ({exc}). Delete it, or run with --fresh."
             ) from exc
 
+    def _has_column(self, name: str) -> bool:
+        columns = self._conn.execute("PRAGMA table_info(collections)").fetchall()
+        return any(column[1] == name for column in columns)
+
     def _prepare(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
@@ -233,6 +240,15 @@ class CheckpointStore:
         if version == 0:
             with self._conn:
                 self._conn.execute(_CREATE)
+                self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version < SCHEMA_VERSION:
+            # Migration 1 -> 2. DDL is not transactional here, so every step is repeatable:
+            # a crash half-way leaves a file that the next start can finish.
+            with self._conn:
+                if not self._has_column("dlq_offset"):
+                    self._conn.execute(
+                        "ALTER TABLE collections ADD COLUMN dlq_offset INTEGER NOT NULL DEFAULT 0"
+                    )
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
@@ -245,7 +261,8 @@ class CheckpointStore:
     def load(self) -> dict[str, CollectionState]:
         try:
             rows = self._conn.execute(
-                "SELECT name, fingerprint, status, cursor, progress, updated_at FROM collections"
+                "SELECT name, fingerprint, status, cursor, progress, updated_at, dlq_offset "
+                "FROM collections"
             ).fetchall()
         except sqlite3.Error as exc:
             raise CheckpointError(f"Could not read the checkpoint: {exc}") from exc
@@ -257,21 +274,34 @@ class CheckpointStore:
                 cursor=decode_cursor(cursor) if cursor is not None else None,
                 progress=Progress.from_json(progress),
                 updated_at=updated_at,
+                dlq_offset=int(dlq_offset),
             )
-            for name, fingerprint, status, cursor, progress, updated_at in rows
+            for name, fingerprint, status, cursor, progress, updated_at, dlq_offset in rows
         }
 
     def save_progress(
-        self, name: str, fingerprint: str, cursor: Cursor, progress: Progress
+        self,
+        name: str,
+        fingerprint: str,
+        cursor: Cursor,
+        progress: Progress,
+        dlq_offset: int = 0,
     ) -> None:
         """Record that everything up to `cursor` is safely written."""
         self._execute(
             _UPSERT,
-            (name, fingerprint, "in_progress", encode_cursor(cursor), progress.to_json(), _now()),
+            (
+                name, fingerprint, "in_progress", encode_cursor(cursor),
+                progress.to_json(), _now(), dlq_offset,
+            ),
         )
 
-    def mark_done(self, name: str, fingerprint: str, progress: Progress) -> None:
-        self._execute(_UPSERT, (name, fingerprint, "done", None, progress.to_json(), _now()))
+    def mark_done(
+        self, name: str, fingerprint: str, progress: Progress, dlq_offset: int = 0
+    ) -> None:
+        self._execute(
+            _UPSERT, (name, fingerprint, "done", None, progress.to_json(), _now(), dlq_offset)
+        )
 
     def discard(self, name: str) -> None:
         self._execute("DELETE FROM collections WHERE name = ?", (name,))
