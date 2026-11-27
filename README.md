@@ -31,7 +31,7 @@ crash-safe precision.
 - [x] Phase 6: Type and precision translator
 - [x] Phase 7: Transform engine
 - [x] Phase 8: Join folding
-- [ ] Phase 9: Checkpointing and resume
+- [x] Phase 9: Checkpointing and crash resume
 - [ ] Phase 10: Dead-letter queue
 - [ ] Phase 11: Concurrency
 - [ ] Phase 12: Verification audit, run reports and dry run
@@ -250,6 +250,29 @@ Children are fetched per batch with `WHERE fk IN (...)` (no N+1 queries) and
 ordered by primary key, so reruns are idempotent. Documents are
 all-or-nothing: a rejected embedded row rejects its document. Rules see
 embedded fields (`len(orders)`). See [`docs/folding.md`](docs/folding.md).
+
+### Crash safety: checkpoints and resume
+
+Progress is saved after every batch (a SQLite file in `.polymorph/`). If a run
+is killed or fails, run the same command again: finished collections are
+skipped and the unfinished one continues after its last checkpoint. Nothing is
+duplicated, and the counts and the exit code cover the whole run.
+
+```bash
+polymorph run pipeline.yaml            # interrupted (kill -9, power loss, network drop)
+polymorph status pipeline.yaml         # what was saved
+polymorph run pipeline.yaml            # resumes where it stopped
+
+polymorph run pipeline.yaml --fresh          # discard saved progress, start over
+polymorph run pipeline.yaml --no-checkpoint  # neither save nor use checkpoints
+```
+
+The batch is written to MongoDB first and checkpointed second, so a crash can
+at worst repeat one batch, which idempotent upserts make harmless. A
+fingerprint of the configuration and the source schema protects against
+resuming with stale progress, and an OS file lock keeps two runs of one
+pipeline apart. See [`docs/checkpointing.md`](docs/checkpointing.md), including
+how to inject a crash for testing.
 
 ## Continuous integration
 
